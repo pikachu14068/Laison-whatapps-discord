@@ -1,72 +1,57 @@
 // ================= IMPORTS =================
 const { Client: DiscordClient, GatewayIntentBits } = require("discord.js");
-const { Client: WhatsAppClient, LocalAuth } = require("whatsapp-web.js");
+const { Client: WhatsAppClient, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 
 // ================= CONFIG =================
-const DISCORD_TOKEN = "TON_DISCORD_TOKEN";
-const DISCORD_CHANNEL_ID = "ID_DU_CHANNEL_DISCORD";
+const DISCORD_TOKEN = "TON_DISCORD_BOT_TOKEN";
+const WHATSAPP_MEDIA_FOLDER = path.join(__dirname, "media");
+const USERS_ACCEPT_FILE = path.join(__dirname, "usersAccepted.json");
 
-// ================= VARIABLES =================
-const discordClient = new DiscordClient({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
-});
+// ================= INIT =================
+if (!fs.existsSync(WHATSAPP_MEDIA_FOLDER)) fs.mkdirSync(WHATSAPP_MEDIA_FOLDER);
+let usersAccepted = new Set();
+if (fs.existsSync(USERS_ACCEPT_FILE)) {
+    usersAccepted = new Set(JSON.parse(fs.readFileSync(USERS_ACCEPT_FILE, "utf8")));
+}
+
+// ================= CLIENTS =================
+const discordClient = new DiscordClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
 const whatsappClient = new WhatsAppClient({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({ clientId: "bot-whatsapp" }),
     puppeteer: {
         headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox"]
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
 });
 
 let whatsappReady = false;
 let whatsappGroups = [];
-let targetGroup = null;
-
-// ========== UTILISATEURS ACCEPTES ==========
-const acceptFilePath = path.join(__dirname, "usersAccepted.json");
-let usersAccepted = new Set();
-
-// Charge les utilisateurs depuis le fichier
-if (fs.existsSync(acceptFilePath)) {
-    const data = fs.readFileSync(acceptFilePath, "utf-8");
-    try {
-        const list = JSON.parse(data);
-        usersAccepted = new Set(list);
-        console.log(`Utilisateurs acceptes charges: ${list.length}`);
-    } catch (err) {
-        console.error("Erreur lecture usersAccepted.json :", err);
-    }
-}
-
-// Sauvegarde dans le fichier
-function saveUsersAccepted() {
-    fs.writeFileSync(acceptFilePath, JSON.stringify([...usersAccepted], null, 2));
-}
+let selectedGroupId = null;
 
 // ================= WHATSAPP =================
 whatsappClient.on("qr", qr => {
+    console.log("QR WhatsApp:");
     qrcode.generate(qr, { small: true });
-    console.log("Scanne ce QR code avec WhatsApp !");
 });
 
 whatsappClient.on("ready", async () => {
-    whatsappReady = true;
     console.log("WhatsApp pret !");
+    whatsappReady = true;
+
+    // Charger la liste des groupes
     const chats = await whatsappClient.getChats();
     whatsappGroups = chats.filter(c => c.isGroup);
-    console.log(`Groupes WhatsApp charges: ${whatsappGroups.length}`);
-});
-
-whatsappClient.on("message", msg => {
-    console.log(`Message WhatsApp recu de ${msg.from}: ${msg.body}`);
+    if (whatsappGroups.length) {
+        console.log("Groupes WhatsApp disponibles:");
+        whatsappGroups.forEach((g, i) => console.log(`${i + 1}. ${g.name}`));
+    } else {
+        console.log("Aucun groupe WhatsApp trouve.");
+    }
 });
 
 whatsappClient.initialize();
@@ -76,67 +61,91 @@ discordClient.on("ready", () => {
     console.log(`Discord connecte : ${discordClient.user.tag}`);
 });
 
-discordClient.on("messageCreate", async (message) => {
-    if (message.author.bot) return;
-    if (message.channel.id !== DISCORD_CHANNEL_ID) return;
+// ================= UTILITAIRES =================
+async function downloadAttachment(url, folder) {
+    const fileName = path.basename(url);
+    const filePath = path.join(folder, fileName);
+    const response = await axios({ url, method: "GET", responseType: "stream" });
+    const writer = fs.createWriteStream(filePath);
+    response.data.pipe(writer);
+    await new Promise((resolve, reject) => {
+        writer.on("finish", resolve);
+        writer.on("error", reject);
+    });
+    return filePath;
+}
 
-    // ========== ACCEPTATION DES CONDITIONS ==========
+// ================= DISCORD MESSAGE =================
+discordClient.on("messageCreate", async message => {
+    if (message.author.bot) return;
+
+    const msg = message.content.trim();
+    const args = msg.split(" ");
+    const command = args.shift().toLowerCase();
+
+    // =========== COMMANDES CONDITIONS ===========
     if (!usersAccepted.has(message.author.id)) {
-        if (message.content.toLowerCase() === "!accepte") {
+        if (command === "!accepte") {
             usersAccepted.add(message.author.id);
-            saveUsersAccepted();
-            return message.reply("Merci, vous avez accepte les conditions. Vous pouvez maintenant utiliser les commandes et envoyer des messages vers WhatsApp.");
+            fs.writeFileSync(USERS_ACCEPT_FILE, JSON.stringify([...usersAccepted]));
+            return message.reply("Merci, vous avez accepte les conditions. Vous pouvez maintenant utiliser le bot.");
         } else {
             return message.reply(
 `Vous devez accepter les conditions avant d'utiliser le bot
 
-Conditions de linterface WhatsApp:
-- Pas de spam (1 message toutes les 5 secondes max)
-- Linterface WhatsApp est uniquement pour parler de lecole
-- Les messages inutiles ou hors sujet sont interdits
-- Contenu illegal ou inapproprie interdit
-- Aucune insulte ne sera toleree
+**Conditions de l'interface WhatsApp**:
 
-Tapez !accepte pour accepter.`
-            );
+- Pas de spam
+- 1 message toutes les 5 secondes maximum
+- L'interface WhatsApp est uniquement pour parler de l'ecole
+- Les messages hors sujet ou inutiles sont interdits
+- Aucun contenu illegal ou inapproprie est tolere
+- Aucune insulte n'est autorisee
+
+Tapez "!accepte" pour accepter.`)
         }
     }
 
-    // ========== COMMANDES POUR LES GROUPES ==========
-    const content = message.content.trim();
-
-    if (content.toLowerCase() === "!groupes") {
-        if (!whatsappReady) return message.reply("WhatsApp n'est pas pret.");
-        if (whatsappGroups.length === 0) return message.reply("Aucun groupe trouve.");
-        let reply = "Liste des groupes WhatsApp:\n";
-        whatsappGroups.forEach((g, i) => {
-            reply += `${i + 1}. ${g.name}\n`;
-        });
-        return message.reply(reply);
+    // =========== COMMANDES GROUPES ===========
+    if (command === "!groupes") {
+        if (!whatsappGroups.length) return message.reply("Aucun groupe WhatsApp disponible.");
+        let list = whatsappGroups.map((g, i) => `${i + 1}. ${g.name}`).join("\n");
+        return message.reply(`Liste des groupes WhatsApp:\n${list}`);
     }
 
-    if (content.toLowerCase().startsWith("!select ")) {
-        const args = content.split(" ");
-        const index = parseInt(args[1], 10);
-        if (isNaN(index) || index < 1 || index > whatsappGroups.length) {
-            return message.reply("Numero de groupe invalide.");
-        }
-        targetGroup = whatsappGroups[index - 1];
-        return message.reply(`Groupe WhatsApp selectionne: ${targetGroup.name}`);
+    if (command === "!select") {
+        const index = parseInt(args[0]);
+        if (!index || index < 1 || index > whatsappGroups.length) return message.reply("Numero de groupe invalide.");
+        selectedGroupId = whatsappGroups[index - 1].id._serialized;
+        return message.reply(`Groupe WhatsApp selectionne : ${whatsappGroups[index - 1].name}`);
     }
 
-    // ========== RELAIS AUTOMATIQUE ==========
-    if (!whatsappReady || !targetGroup) {
-        return message.reply("WhatsApp n'est pas pret ou aucun groupe n'est selectionne.");
-    }
+    // =========== ENVOI AUTOMATIQUE ===========
+    if (!whatsappReady) return message.reply("WhatsApp n'est pas encore pret.");
+
+    if (!selectedGroupId) return message.reply("Vous devez selectionner un groupe WhatsApp avec !select X");
 
     try {
-        await whatsappClient.sendMessage(targetGroup.id._serialized, `${message.author.username}: ${message.content}`);
-        console.log(`Relais Discord -> WhatsApp : ${message.content}`);
+        // Gestion des fichiers joints
+        if (message.attachments.size > 0) {
+            for (const attachment of message.attachments.values()) {
+                const filePath = await downloadAttachment(attachment.url, WHATSAPP_MEDIA_FOLDER);
+                const media = MessageMedia.fromFilePath(filePath);
+                await whatsappClient.sendMessage(selectedGroupId, media);
+                console.log(`Envoye ${attachment.name} sur WhatsApp`);
+            }
+        }
+
+        // Gestion message texte
+        if (msg && !msg.startsWith("!")) {
+            await whatsappClient.sendMessage(selectedGroupId, msg);
+            console.log(`Envoye texte sur WhatsApp: ${msg}`);
+        }
+
     } catch (err) {
-        console.error("Erreur lors de l'envoi vers WhatsApp :", err);
-        message.reply("Une erreur est survenue lors de l'envoi vers WhatsApp.");
+        console.error("Erreur en envoyant le message sur WhatsApp:", err);
     }
 });
 
+// ================= LANCEMENT =================
 discordClient.login(DISCORD_TOKEN);
