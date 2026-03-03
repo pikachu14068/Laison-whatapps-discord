@@ -1,6 +1,6 @@
 {
   "name": "whatapps-discord",
-  "version": "2.2.1",
+  "version": "2.2.4",
   "main": "bot.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
