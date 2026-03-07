@@ -1,147 +1,250 @@
 // ================= IMPORTS =================
-const fs = require('fs');
-const path = require('path');
-const { Client: DiscordClient, GatewayIntentBits } = require('discord.js');
-const { Client: WhatsAppClient, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const QRCode = require('qrcode');
+const fs = require('fs')
+const path = require('path')
+const { Client: DiscordClient, GatewayIntentBits } = require('discord.js')
+const { Client: WhatsAppClient, LocalAuth, MessageMedia } = require('whatsapp-web.js')
+const QRCode = require('qrcode')
+const qrcodeTerminal = require('qrcode-terminal')
 
 // ================= CONFIG =================
-const DISCORD_TOKEN = 'Ton token';
-const DISCORD_CHANNEL_ID = 'Ton discord ID';
-const MEDIA_DIR = './media';
-const WHATSAPP_SESSION_DIR = './whatsapp-session';
+const DISCORD_TOKEN = "TON_TOKEN_DISCORD"
+const DISCORD_CHANNEL_ID = "TON_CHANNEL_ID"
 
-if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+const MEDIA_DIR = "./media"
+if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR)
 
-let selectedGroupId = null;
+// ================= VARIABLES =================
+let selectedGroupId = null
+const messageMap = new Map()
 
-// ================= CLIENT WHATSAPP =================
-const whatsappClient = new WhatsAppClient({
-    authStrategy: new LocalAuth({ clientId: 'bot-whatsapp' }),
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] }
-});
-
-// ================= CLIENT DISCORD =================
+// ================= DISCORD =================
 const discordClient = new DiscordClient({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
-});
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ]
+})
+
+// ================= WHATSAPP =================
+const whatsappClient = new WhatsAppClient({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        headless: true,
+        args: ['--no-sandbox','--disable-setuid-sandbox']
+    }
+})
 
 // ================= QR CODE =================
 whatsappClient.on('qr', async (qr) => {
-    console.log('QR WhatsApp genere:');
 
-    // Génère le QR en console pour debug
-    require('qrcode-terminal').generate(qr, { small: true });
+    console.log("QR généré")
+    qrcodeTerminal.generate(qr, {small:true})
 
-    // Génère le QR code en image PNG
-    const dataUrl = await QRCode.toDataURL(qr);
-    // Converti base64 -> buffer
-    const base64Data = dataUrl.replace(/^data:image\/png;base64,/, '');
-    const buffer = Buffer.from(base64Data, 'base64');
+    const dataUrl = await QRCode.toDataURL(qr)
+    const base64 = dataUrl.replace(/^data:image\/png;base64,/,"")
+    const buffer = Buffer.from(base64,'base64')
 
-    const channel = discordClient.channels.cache.get(DISCORD_CHANNEL_ID);
-    if (channel && channel.isTextBased()) {
-        await channel.send({ content: 'Voici le QR code pour WhatsApp :', files: [{ attachment: buffer, name: 'whatsapp_qr.png' }] });
-        console.log('QR code image envoye sur Discord !');
-    }
-});
+    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
+
+    await channel.send({
+        content:"Scanner ce QR pour connecter WhatsApp",
+        files:[{attachment:buffer,name:"whatsapp_qr.png"}]
+    })
+
+})
+
 // ================= READY =================
-whatsappClient.on('ready', () => console.log('WhatsApp pret !'));
-discordClient.once('ready', () => console.log('Discord connecte !'));
+whatsappClient.on("ready", () => {
+    console.log("WhatsApp prêt")
+})
 
-// ================= UTILITAIRES =================
-function saveMedia(data, ext, prefix='file') {
-    const buffer = Buffer.from(data, 'base64');
-    const filename = `${prefix}_${Date.now()}.${ext}`;
-    const filepath = path.join(MEDIA_DIR, filename);
-    fs.writeFileSync(filepath, buffer);
-    return filepath;
+discordClient.once("ready", () => {
+    console.log("Discord prêt")
+})
+
+// ================= SAUVEGARDE MEDIA =================
+function saveMedia(buffer,ext){
+
+    const name = Date.now()+"."+ext
+    const file = path.join(MEDIA_DIR,name)
+
+    fs.writeFileSync(file,buffer)
+
+    return file
 }
 
-// ================= WHATSAPP -> DISCORD =================
-whatsappClient.on('message', async (msg) => {
-    try {
-        if (!selectedGroupId) return;
-        if (msg.from !== selectedGroupId) return;
+// ================= WHATSAPP → DISCORD =================
+whatsappClient.on("message", async msg => {
 
-        const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
-        const contact = await msg.getContact();
-        const pseudo = contact.pushname || contact.name || contact.number || "Utilisateur";
+    if (!selectedGroupId) return
+    if (msg.from !== selectedGroupId) return
 
-        // TEXTE
-        if (msg.body && !msg.hasMedia) {
-            await channel.send(`${pseudo}: ${msg.body}`);
-        }
+    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
 
-        // MEDIA
-        if (msg.hasMedia) {
-            const media = await msg.downloadMedia();
-            if (!media) return;
+    const contact = await msg.getContact()
+    const pseudo = contact.pushname || contact.name || contact.number
 
-            let ext = 'dat';
-            if (msg.type === 'image') ext = 'png';
-            if (msg.type === 'video') ext = 'mp4';
-            if (msg.type === 'audio' || msg.type === 'ptt') ext = 'ogg';
-            if (msg.type === 'sticker') ext = 'webp';
+    try{
 
-            const filePath = saveMedia(media.data, ext, msg.type);
+        let reference = null
 
-            const labelMap = { 'ptt':'[Vocal]', 'audio':'[Audio]', 'video':'[Video]', 'image':'[Image]', 'sticker':'[Sticker]' };
-            const label = labelMap[msg.type] || '[Fichier]';
+        if (msg.hasQuotedMsg){
 
-            await channel.send({ content: `${pseudo}: ${label}`, files: [filePath] });
-        }
+            const quoted = await msg.getQuotedMessage()
 
-    } catch (err) { console.error('Erreur WA -> Discord:', err); }
-});
-
-// ================= DISCORD -> WHATSAPP =================
-discordClient.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
-    if (!selectedGroupId || !whatsappClient.info) return;
-
-    const content = message.content.trim();
-    await whatsappClient.sendMessage(selectedGroupId, `${message.author.username}: ${content}`);
-
-    // Fichiers attaches
-    if (message.attachments.size > 0) {
-        for (const attachment of message.attachments.values()) {
-            try {
-                const media = await MessageMedia.fromUrl(attachment.url);
-                await whatsappClient.sendMessage(selectedGroupId, media);
-            } catch(err) {
-                console.error('Erreur en envoyant media Discord -> WhatsApp:', err);
+            for (const [discordId,waId] of messageMap.entries()){
+                if (waId === quoted.id._serialized){
+                    reference = discordId
+                    break
+                }
             }
+
         }
+
+        // ===== TEXTE =====
+        if (msg.body && !msg.hasMedia){
+
+            const sent = await channel.send({
+                content:`${pseudo} : ${msg.body}`,
+                reply: reference ? {messageReference:reference} : undefined
+            })
+
+            messageMap.set(sent.id,msg.id._serialized)
+
+        }
+
+        // ===== MEDIA =====
+        if (msg.hasMedia){
+
+            const media = await msg.downloadMedia()
+            if (!media) return
+
+            const buffer = Buffer.from(media.data,'base64')
+
+            let ext="dat"
+
+            if (msg.type==="image") ext="png"
+            if (msg.type==="video") ext="mp4"
+            if (msg.type==="audio"||msg.type==="ptt") ext="ogg"
+            if (msg.type==="sticker") ext="webp"
+
+            const file = saveMedia(buffer,ext)
+
+            const sent = await channel.send({
+                content:`${pseudo} : [${msg.type}]`,
+                files:[file]
+            })
+
+            messageMap.set(sent.id,msg.id._serialized)
+
+        }
+
+    }catch(err){
+        console.error("Erreur WA → Discord",err)
     }
-});
 
-// ================= COMMANDES GROUPES =================
-discordClient.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
-    const content = message.content.trim();
+})
 
-    if (content === '!groupes') {
-        if (!whatsappClient.info) return message.reply('WhatsApp pas encore pret.');
-        const chats = await whatsappClient.getChats();
-        const groups = chats.filter(c => c.isGroup);
-        if (groups.length === 0) return message.reply('Aucun groupe WhatsApp trouve.');
-        let reply = 'Groupes WhatsApp disponibles:\n';
-        groups.forEach((g, i) => reply += `${i+1}. ${g.name}\n`);
-        return message.reply(reply);
+// ================= DISCORD → WHATSAPP =================
+discordClient.on("messageCreate", async message => {
+
+    if (message.author.bot) return
+    if (!selectedGroupId) return
+
+    const displayName = message.member?.displayName || message.author.username
+
+    try{
+
+        let quoted=null
+
+        if (message.reference?.messageId){
+
+            const waId = messageMap.get(message.reference.messageId)
+            if (waId) quoted = waId
+
+        }
+
+        // ===== TEXTE =====
+        if (message.content){
+
+            const sent = await whatsappClient.sendMessage(
+                selectedGroupId,
+                `${displayName} : ${message.content}`,
+                quoted ? {quotedMessageId:quoted} : {}
+            )
+
+            messageMap.set(message.id,sent.id._serialized)
+
+        }
+
+        // ===== MEDIA =====
+        for (const att of message.attachments.values()){
+
+            const media = await MessageMedia.fromUrl(att.url)
+
+            const sent = await whatsappClient.sendMessage(
+                selectedGroupId,
+                media,
+                {
+                    caption:`${displayName} : [media]`,
+                    quotedMessageId:quoted || undefined
+                }
+            )
+
+            messageMap.set(message.id,sent.id._serialized)
+
+        }
+
+    }catch(err){
+        console.error("Erreur Discord → WhatsApp",err)
     }
 
-    if (content.startsWith('!select ')) {
-        if (!whatsappClient.info) return message.reply('WhatsApp pas encore pret.');
-        const chats = await whatsappClient.getChats();
-        const groups = chats.filter(c => c.isGroup);
-        const index = parseInt(content.split(' ')[1])-1;
-        if (isNaN(index) || index < 0 || index >= groups.length) return message.reply('Numero invalide.');
-        selectedGroupId = groups[index].id._serialized;
-        return message.reply(`Groupe WhatsApp selectionne: ${groups[index].name}`);
-    }
-});
+})
 
-// ================= DEMARRAGE =================
-whatsappClient.initialize();
-discordClient.login(DISCORD_TOKEN);
+// ================= COMMANDES =================
+discordClient.on("messageCreate", async message => {
+
+    if (message.author.bot) return
+
+    const content = message.content.trim()
+
+    if (content === "!groupes"){
+
+        const chats = await whatsappClient.getChats()
+        const groups = chats.filter(c=>c.isGroup)
+
+        if (!groups.length)
+            return message.reply("Aucun groupe trouvé")
+
+        let txt="Groupes WhatsApp :\n"
+
+        groups.forEach((g,i)=>{
+            txt+=`${i+1}. ${g.name}\n`
+        })
+
+        message.reply(txt)
+
+    }
+
+    if (content.startsWith("!select ")){
+
+        const num=parseInt(content.split(" ")[1])-1
+
+        const chats = await whatsappClient.getChats()
+        const groups = chats.filter(c=>c.isGroup)
+
+        if (!groups[num])
+            return message.reply("Numéro invalide")
+
+        selectedGroupId = groups[num].id._serialized
+
+        message.reply("Groupe sélectionné : "+groups[num].name)
+
+    }
+
+})
+
+// ================= START =================
+discordClient.login(DISCORD_TOKEN)
+whatsappClient.initialize()
