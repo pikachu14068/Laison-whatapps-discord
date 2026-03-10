@@ -1,277 +1,269 @@
-// ================= IMPORTS =================
+const { Client, GatewayIntentBits } = require("discord.js")
+const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
+const qrcode = require("qrcode")
 const fs = require("fs")
 const path = require("path")
-const { Client: DiscordClient, GatewayIntentBits } = require("discord.js")
-const { Client: WhatsAppClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
-const QRCode = require("qrcode")
 
-// ================= CONFIG =================
 const DISCORD_TOKEN = "TOKEN_DISCORD"
 const DISCORD_CHANNEL_ID = "CHANNEL_ID"
 
-const MEDIA_DIR = "./media"
-if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR)
-
 let selectedGroupId = null
+let whatsappReady = false
+
 const messageMap = new Map()
 
-// ================= DISCORD =================
-const discordClient = new DiscordClient({
-    intents:[
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
-})
+const mediaFolder = "./media"
 
-// ================= WHATSAPP =================
-const whatsappClient = new WhatsAppClient({
-    authStrategy:new LocalAuth(),
-    puppeteer:{
-        headless:true,
-        args:["--no-sandbox","--disable-setuid-sandbox"]
-    }
-})
-
-// ================= QR CODE =================
-whatsappClient.on("qr", async qr => {
-
-    const dataUrl = await QRCode.toDataURL(qr)
-    const base64 = dataUrl.replace(/^data:image\/png;base64,/,"")
-    const buffer = Buffer.from(base64,"base64")
-
-    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
-
-    await channel.send({
-        content:"Scanner ce QR pour connecter WhatsApp",
-        files:[{attachment:buffer,name:"whatsapp_qr.png"}]
-    })
-
-})
-
-// ================= READY =================
-whatsappClient.on("ready",()=>console.log("WhatsApp prêt"))
-discordClient.once("ready",()=>console.log("Discord prêt"))
-
-// ================= SAVE MEDIA =================
-function saveMedia(buffer,ext){
-
-    const name = Date.now()+"."+ext
-    const file = path.join(MEDIA_DIR,name)
-
-    fs.writeFileSync(file,buffer)
-
-    return file
+if(!fs.existsSync(mediaFolder)){
+fs.mkdirSync(mediaFolder)
 }
 
-// ================= WHATSAPP → DISCORD =================
-whatsappClient.on("message", async msg=>{
+const discordClient = new Client({
+intents:[
+GatewayIntentBits.Guilds,
+GatewayIntentBits.GuildMessages,
+GatewayIntentBits.MessageContent
+]
+})
 
-    if(!selectedGroupId) return
-    if(msg.from!==selectedGroupId) return
+const whatsappClient = new WAClient({
+authStrategy:new LocalAuth(),
+puppeteer:{
+args:["--no-sandbox","--disable-setuid-sandbox"]
+}
+})
 
-    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
+/* ================= DISCORD READY ================= */
 
-    const contact = await msg.getContact()
-    const pseudo = contact.pushname || contact.name || contact.number
+discordClient.once("clientReady",()=>{
+console.log("Discord connecté")
+})
 
-    try{
+/* ================= WHATSAPP QR ================= */
 
-        if(msg.body && !msg.hasMedia){
+whatsappClient.on("qr", async qr => {
 
-            const sent = await channel.send(`${pseudo} : ${msg.body}`)
+const qrImage = await qrcode.toDataURL(qr)
 
-            messageMap.set(sent.id,msg.id._serialized)
+const base64 = qrImage.split(",")[1]
+const buffer = Buffer.from(base64,"base64")
 
-        }
+fs.writeFileSync("qr.png",buffer)
 
-        if(msg.hasMedia){
+const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
 
-            const media = await msg.downloadMedia()
-            if(!media) return
-
-            const buffer = Buffer.from(media.data,"base64")
-
-            let ext="dat"
-
-            if(msg.type==="image") ext="png"
-            if(msg.type==="video") ext="mp4"
-            if(msg.type==="audio"||msg.type==="ptt") ext="ogg"
-            if(msg.type==="sticker") ext="webp"
-
-            const file = saveMedia(buffer,ext)
-
-            const sent = await channel.send({
-                content:`${pseudo} : [${msg.type}]`,
-                files:[file]
-            })
-
-            messageMap.set(sent.id,msg.id._serialized)
-
-        }
-
-    }catch(err){
-        console.log(err)
-    }
+channel.send({
+content:"Voici le QR code WhatsApp",
+files:["qr.png"]
+})
 
 })
 
-// ================= DISCORD → WHATSAPP =================
-discordClient.on("messageCreate", async message=>{
+/* ================= WHATSAPP READY ================= */
 
-    if(message.author.bot) return
-    if(!selectedGroupId) return
+whatsappClient.on("ready",()=>{
+console.log("WhatsApp prêt")
+whatsappReady = true
+})
 
-    const displayName = message.member?.displayName || message.author.username
+/* ================= COMMANDES DISCORD ================= */
 
-    try{
+discordClient.on("messageCreate", async message => {
 
-        if(message.content){
+if(message.author.bot) return
+if(message.channel.id !== DISCORD_CHANNEL_ID) return
 
-            const sent = await whatsappClient.sendMessage(
-                selectedGroupId,
-                `${displayName} : ${message.content}`
-            )
+/* GROUPES */
 
-            messageMap.set(message.id,sent.id._serialized)
+if(message.content === "!groupes"){
 
-        }
+if(!whatsappReady){
+return message.reply("WhatsApp pas encore prêt")
+}
 
-        for(const att of message.attachments.values()){
+const chats = await whatsappClient.getChats()
+const groups = chats.filter(c=>c.isGroup)
 
-            const media = await MessageMedia.fromUrl(att.url)
+let txt="Groupes WhatsApp :\n"
 
-            const sent = await whatsappClient.sendMessage(
-                selectedGroupId,
-                media,
-                {caption:`${displayName} : [media]`}
-            )
+groups.forEach((g,i)=>{
+txt+=`${i} - ${g.name}\n`
+})
 
-            messageMap.set(message.id,sent.id._serialized)
+message.channel.send(txt)
+}
 
-        }
+/* SELECT */
 
-    }catch(err){
-        console.log(err)
-    }
+if(message.content.startsWith("!select")){
+
+const index=parseInt(message.content.split(" ")[1])
+
+const chats=await whatsappClient.getChats()
+const groups=chats.filter(c=>c.isGroup)
+
+if(!groups[index]){
+return message.reply("Index invalide")
+}
+
+selectedGroupId=groups[index].id._serialized
+
+message.channel.send("Groupe sélectionné : "+groups[index].name)
+}
+
+/* DISCORD → WHATSAPP */
+
+if(!selectedGroupId) return
+if(message.content.startsWith("!")) return
+
+const displayName =
+message.member?.displayName || message.author.username
+
+let options={}
+
+/* REPLY */
+
+if(message.reference){
+
+try{
+
+const replied =
+await message.channel.messages.fetch(message.reference.messageId)
+
+const waQuotedId=messageMap.get(replied.id)
+
+if(waQuotedId){
+options.quotedMessageId=waQuotedId
+}
+
+}catch{}
+}
+
+/* TEXTE */
+
+if(message.content){
+
+const sent=await whatsappClient.sendMessage(
+selectedGroupId,
+`${displayName} : ${message.content}`,
+options
+)
+
+messageMap.set(message.id,sent.id._serialized)
+
+}
+
+/* FICHIERS DISCORD → WHATSAPP */
+
+if(message.attachments.size>0){
+
+for(const attachment of message.attachments.values()){
+
+const media=await MessageMedia.fromUrl(attachment.url)
+
+await whatsappClient.sendMessage(
+selectedGroupId,
+media,
+{caption:displayName}
+)
+
+}
+
+}
 
 })
 
-// ================= SUPPRESSION =================
-discordClient.on("messageDelete", async message=>{
+/* ================= WHATSAPP → DISCORD ================= */
 
-    const waId = messageMap.get(message.id)
-    if(!waId) return
+whatsappClient.on("message", async msg => {
 
-    try{
+if(!selectedGroupId) return
+if(msg.from!==selectedGroupId) return
+if(msg.fromMe) return
 
-        const chat = await whatsappClient.getChatById(selectedGroupId)
-        const msgs = await chat.fetchMessages({limit:50})
+const contact=await msg.getContact()
+const name=contact.pushname||contact.number
 
-        const target = msgs.find(m=>m.id._serialized===waId)
+const channel=await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
 
-        if(target) await target.delete(true)
+let replyOptions={}
 
-    }catch(err){}
+/* REPLY */
+
+if(msg.hasQuotedMsg){
+
+const quoted=await msg.getQuotedMessage()
+
+for(const [discordId,waId] of messageMap.entries()){
+
+if(waId===quoted.id._serialized){
+
+replyOptions.messageReference=discordId
+break
+
+}
+
+}
+
+}
+
+const sent=await channel.send({
+content:`**${name} :** ${msg.body}`,
+...replyOptions
+})
+
+messageMap.set(sent.id,msg.id._serialized)
+
+/* MEDIA */
+
+if(msg.hasMedia){
+
+const media=await msg.downloadMedia()
+
+let ext="png"
+
+if(media.mimetype.includes("video")) ext="mp4"
+if(media.mimetype.includes("audio")) ext="ogg"
+
+const filename=Date.now()+"."+ext
+
+const filepath=path.join(mediaFolder,filename)
+
+fs.writeFileSync(filepath,media.data,"base64")
+
+channel.send({
+files:[filepath]
+})
+
+}
 
 })
 
-// ================= WA DELETE =================
-whatsappClient.on("message_revoke_everyone", async msg=>{
+/* ================= SUPPRESSION SYNC ================= */
 
-    for(const [discordId,waId] of messageMap.entries()){
+discordClient.on("messageDelete", async message => {
 
-        if(waId===msg.id._serialized){
+const waId=messageMap.get(message.id)
 
-            const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID)
+if(!waId) return
 
-            try{
+try{
 
-                const m = await channel.messages.fetch(discordId)
-                m.delete()
+const chat=await whatsappClient.getChatById(selectedGroupId)
 
-            }catch(e){}
+const msgs=await chat.fetchMessages({limit:50})
 
-        }
+const target=msgs.find(m=>m.id._serialized===waId)
 
-    }
+if(target){
+await target.delete(true)
+}
 
-})
-
-// ================= MODIFICATION =================
-discordClient.on("messageUpdate", async(oldMsg,newMsg)=>{
-
-    if(newMsg.author.bot) return
-    if(!selectedGroupId) return
-
-    const displayName = newMsg.member?.displayName || newMsg.author.username
-
-    await whatsappClient.sendMessage(
-        selectedGroupId,
-        `✏️ Message modifié :\n${displayName} : ${newMsg.content}`
-    )
+}catch{}
 
 })
 
-// ================= PIN DISCORD =================
-discordClient.on("channelPinsUpdate", async channel=>{
+/* ================= START ================= */
 
-    if(channel.id!==DISCORD_CHANNEL_ID) return
-
-    const pins = await channel.messages.fetchPinned()
-    const last = pins.first()
-
-    if(!last) return
-
-    const displayName = last.member?.displayName || last.author.username
-
-    await whatsappClient.sendMessage(
-        selectedGroupId,
-        `📌 Message épinglé :\n${displayName} : ${last.content}`
-    )
-
-})
-
-// ================= COMMANDES =================
-discordClient.on("messageCreate", async message=>{
-
-    if(message.author.bot) return
-
-    const content = message.content.trim()
-
-    if(content==="!groupes"){
-
-        const chats = await whatsappClient.getChats()
-        const groups = chats.filter(c=>c.isGroup)
-
-        let txt="Groupes WhatsApp :\n"
-
-        groups.forEach((g,i)=>{
-            txt+=`${i+1}. ${g.name}\n`
-        })
-
-        message.reply(txt)
-
-    }
-
-    if(content.startsWith("!select ")){
-
-        const num=parseInt(content.split(" ")[1])-1
-
-        const chats = await whatsappClient.getChats()
-        const groups = chats.filter(c=>c.isGroup)
-
-        if(!groups[num])
-            return message.reply("Numéro invalide")
-
-        selectedGroupId = groups[num].id._serialized
-
-        message.reply("Groupe sélectionné : "+groups[num].name)
-
-    }
-
-})
-
-// ================= START =================
 discordClient.login(DISCORD_TOKEN)
 whatsappClient.initialize()
