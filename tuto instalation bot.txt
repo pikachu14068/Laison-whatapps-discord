@@ -1,0 +1,140 @@
+===========================
+GUIDE COMPLET BOT WHATSAPP ↔ DISCORD
+===========================
+
+1️⃣ PRÉ-REQUIS
+-------------
+Avant de commencer, tu auras besoin de :
+1. Un ordinateur Linux (Ubuntu/Debian recommandé)
+2. Un compte Discord avec permission d'ajouter un bot
+3. Un compte WhatsApp mobile pour scanner le QR
+4. Connexion Internet stable
+
+---
+
+2️⃣ INSTALLER NODE.JS ET NPM SUR LINUX
+--------------------------------------
+Ouvre un terminal et tape :
+
+Mettre à jour les paquets
+sudo apt update && sudo apt upgrade -y
+
+Installer Node.js et npm
+sudo apt install nodejs npm -y
+
+Vérifier l'installation
+node -v
+npm -v
+
+⚠️ Option pour une version plus récente de Node.js :
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+---
+
+3️⃣ CRÉER LE BOT DISCORD
+-----------------------
+1. Va sur https://discord.com/developers/applications
+2. Clique sur "New Application" et donne un nom
+3. Dans Bot → Add Bot → Yes
+4. Copie le Token du bot (sera utilisé dans le script)
+5. Dans OAuth2 → URL Generator :
+   - Coche "bot"
+   - Permissions : Send Messages, Attach Files, Embed Links
+   - Copie le lien et ouvre-le pour inviter le bot sur ton serveur
+
+---
+
+4️⃣ PRÉPARER LE DOSSIER DU BOT
+-------------------------------
+1. Crée un dossier pour ton projet :
+mkdir wa-discord-bot
+cd wa-discord-bot
+
+2. Copie ton script bot.js dans ce dossier
+3. Crée les dossiers nécessaires :
+mkdir media
+mkdir pp
+
+- media/ → Pour sauvegarder les fichiers envoyés
+- pp/ → Pour les photos de profil des contacts WhatsApp
+
+---
+
+5️⃣ INSTALLER LES DÉPENDANCES
+------------------------------
+Dans le dossier du bot, lance :
+
+npm init -y
+npm install discord.js whatsapp-web.js qrcode node-fetch
+
+Explications :
+- discord.js → communiquer avec Discord
+- whatsapp-web.js → communiquer avec WhatsApp
+- qrcode → générer le QR code
+- node-fetch → télécharger les fichiers attachés
+
+---
+
+6️⃣ CONFIGURER LE SCRIPT
+-------------------------
+1. Ouvre bot.js avec un éditeur (ex : nano bot.js)
+2. Mets ton Discord Token :
+const DISCORD_TOKEN = "ICI_TON_TOKEN";
+3. Mets l'ID du channel Discord :
+const DISCORD_CHANNEL_ID = "ICI_L_ID_DU_CHANNEL";
+4. Vérifie les chemins dans userProfiles (pp/user1.png, etc.)
+5. Vérifie les mots interdits dans bannedWords si nécessaire
+
+---
+
+7️⃣ LANCER LE BOT POUR LA PREMIÈRE FOIS
+---------------------------------------
+Dans le terminal, dans le dossier du bot :
+
+node bot.js
+
+- Le bot va générer un QR code WhatsApp et l’envoyer sur ton channel Discord
+- Ouvre WhatsApp → Menu → WhatsApp Web → Scanner le QR
+- Une fois scanné, le bot est prêt à fonctionner
+
+---
+
+8️⃣ COMMENT ÇA FONCTIONNE
+--------------------------
+WhatsApp → Discord
+- Tous les messages reçus sur WhatsApp ou groupe sont envoyés dans Discord
+- Les photos de profil dans userProfiles apparaissent comme thumbnail
+- Les médias sont sauvegardés dans media/ et envoyés dans Discord
+
+Discord → WhatsApp
+- Tous les messages dans le channel Discord sont envoyés dans le groupe WhatsApp
+- Les fichiers attachés dans Discord sont envoyés sur WhatsApp
+
+---
+
+9️⃣ CONSEILS ET ASTUCES
+------------------------
+1. Anti-boucle : Le bot ne renvoie pas les messages qu’il a déjà relayés
+2. Sauvegarde : Vérifie régulièrement le dossier media/
+3. Redémarrage : node bot.js pour relancer le bot
+4. Sécurité : Ne partage jamais ton Discord Token ni ton QR WhatsApp
+5. Démarrage automatique (optionnel) :
+   npm install -g pm2
+   pm2 start bot.js --name "wa-discord-bot"
+   pm2 save
+
+---
+
+🔟 STRUCTURE FINALE DES DOSSIERS
+---------------------------------
+wa-discord-bot/
+├─ bot.js
+├─ media/          → fichiers médias envoyés
+├─ pp/             → photos de profil
+└─ package.json
+
+---
+
+💡 Optionnel : tu peux créer un schéma pour visualiser le flux :
+WhatsApp ↔ Bot ↔ Discord
