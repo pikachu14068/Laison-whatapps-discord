@@ -17,7 +17,7 @@ const discordClient = new Client({
 });
 
 const DISCORD_TOKEN = "";           // <-- MET TON TOKEN
-const DISCORD_CHANNEL_ID = "";      // <-- MET L'ID DU SALON
+const DISCORD_CHANNEL_ID = "";      // <-- MET TON ID
 
 // WEBHOOK DISCORD
 const WEBHOOK_URL = "";             // <-- MET TON WEBHOOK
@@ -33,15 +33,10 @@ const waClient = new WAClient({
 
 // Dossiers
 const MEDIA_DIR = "./media";
-const PP_DIR = "./pp";
 const LOG_FILE = "./latest.log";
 
 // Filtrage
-const bannedWords = []; // <-- ajoute tes mots
-
-const userProfiles = {
-  // "33600000000@c.us": `${PP_DIR}/user1.png`,
-};
+const bannedWords = []; // <-- ajoute tes mots si tu veux
 
 // ================= ETATS =================
 let waReady = false;
@@ -100,7 +95,6 @@ waClient.on("message", async (msg) => {
 
   const contact = await msg.getContact();
   const name = contact.pushname || contact.number;
-  const number = msg.from;
 
   if(bannedWords.some(w => msg.body?.toLowerCase().includes(w))) return;
 
@@ -108,11 +102,11 @@ waClient.on("message", async (msg) => {
 
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
-    // Avatar
+    // PP WhatsApp auto
     let avatar = null;
-    if(userProfiles[number]){
-      avatar = userProfiles[number];
-    }
+    try{
+      avatar = await contact.getProfilePicUrl();
+    }catch{}
 
     // Reply
     let content = msg.body || "";
@@ -137,11 +131,9 @@ waClient.on("message", async (msg) => {
 
     await webhook.send({
       username: name,
-      avatarURL: avatar ? "attachment://pp.png" : undefined,
+      avatarURL: avatar || undefined,
       content: content || " ",
-      files: avatar
-        ? [{ attachment: avatar, name: "pp.png" }, ...files]
-        : files
+      files: files
     });
 
   }catch(e){
@@ -201,12 +193,12 @@ discordClient.on("messageCreate", async (message) => {
 
     let text = null;
 
-    // ===== MESSAGE NORMAL =====
+    // Message normal
     if(message.content && !message.content.startsWith("!")){
       text = `${name} : ${message.content}`;
     }
 
-    // ===== REPLY DISCORD =====
+    // Reply Discord
     if(message.reference){
       try{
         const replied = await message.channel.messages.fetch(message.reference.messageId);
@@ -218,13 +210,12 @@ discordClient.on("messageCreate", async (message) => {
       }
     }
 
-    // ===== ENVOI TEXTE =====
     if(text){
       const sent = await group.sendMessage(text);
       sentMessages.add(sent.id._serialized);
     }
 
-    // ===== MÉDIAS =====
+    // Médias
     if(message.attachments.size > 0){
       for(const att of message.attachments.values()){
         try{
