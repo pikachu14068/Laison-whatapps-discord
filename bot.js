@@ -94,12 +94,16 @@ waClient.on("message", async (msg) => {
 
   if(!waReady) return;
 
-  // 🔒 FILTRES
-  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return;
-  if (msg.type !== "chat" && !msg.hasMedia) return;
+  // 🔒 Filtrage de base
+  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return; // privé + statut
+  if (msg.type !== "chat" && !msg.hasMedia) return; // messages système
+
+  // 🔥 Filtre groupe sélectionné
+  if (selectedGroup && msg.from !== selectedGroup.id._serialized) return;
 
   const msgId = msg.id._serialized;
 
+  // anti-boucle
   if(sentMessages.has(msgId)){
     sentMessages.delete(msgId);
     return;
@@ -109,10 +113,11 @@ waClient.on("message", async (msg) => {
   const name = contact.pushname || contact.number;
   const number = msg.from;
 
+  // Filtre mots interdits
   if(bannedWords.some(w => msg.body?.toLowerCase().includes(w))) return;
 
   try{
-
+    // Log
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
     let files = [];
@@ -135,7 +140,6 @@ waClient.on("message", async (msg) => {
     // ===== MÉDIAS =====
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
-
       if(media){
         const ext = media.mimetype.split("/")[1];
         const path = `${MEDIA_DIR}/${Date.now()}.${ext}`;
@@ -145,6 +149,7 @@ waClient.on("message", async (msg) => {
       }
     }
 
+    // ===== ENVOI WEBHOOK =====
     await webhook.send({
       username: name,
       content: content || " ",
