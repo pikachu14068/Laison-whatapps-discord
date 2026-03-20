@@ -1,212 +1,211 @@
-TUTO COMPLET BOT DISCORD ↔ WHATSAPP (AVEC WEBHOOK)
+TUTO INSTALLATION BOT WHATSAPP ↔ DISCORD (UBUNTU)
 
-============================================================
+==================================================
+1. INSTALLER NODE.JS
+==================================================
 
-1. PRÉREQUIS
-   ============================================================
+Vérifie si Node est installé :
+node -v
 
-Tu dois avoir :
-
-* Un PC sous Linux (Ubuntu recommandé)
-* Un compte Discord
-* Un compte WhatsApp
-* Internet
-
-============================================================
-2) INSTALLER NODE.JS (LINUX)
-============================
-
-Ouvre un terminal et tape :
+Si pas installé :
 
 sudo apt update
-sudo apt install nodejs npm -y
+sudo apt install -y curl
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
 
-Vérifie l’installation :
-
+Vérifie :
 node -v
 npm -v
 
-Si ça affiche une version → OK
 
-============================================================
-3) CRÉER LE DOSSIER DU BOT
-==========================
+==================================================
+2. CRÉER LE PROJET
+==================================================
 
 mkdir bot-wa-discord
 cd bot-wa-discord
 
-============================================================
-4) INSTALLER LES MODULES
-========================
+
+==================================================
+3. INSTALLER LES MODULES
+==================================================
 
 npm init -y
+npm install discord.js whatsapp-web.js qrcode node-fetch
 
-Puis :
 
-npm install discord.js whatsapp-web.js qrcode node-fetch fs
-
-============================================================
-5) CRÉER LES DOSSIERS NÉCESSAIRES
-=================================
+==================================================
+4. CRÉER LES DOSSIERS
+==================================================
 
 mkdir media
 mkdir pp
 
-============================================================
-6) CRÉER LE FICHIER DU BOT
-==========================
+
+==================================================
+5. AJOUTER LE SCRIPT
+==================================================
 
 nano index.js
 
-Colle dedans TON SCRIPT COMPLET
+Colle ton script dedans
 
 Puis :
-
 CTRL + X
 Y
-Entrée
+ENTER
 
-============================================================
-7) CRÉER LE BOT DISCORD
-=======================
 
-1. Va sur : https://discord.com/developers/applications
+==================================================
+6. CONFIGURER LE SCRIPT
+==================================================
 
-2. Clique sur "New Application"
+Dans index.js :
 
-3. Va dans "Bot"
+const DISCORD_TOKEN = "TON_TOKEN";
+const DISCORD_CHANNEL_ID = "ID_DU_SALON";
+const WEBHOOK_URL = "TON_WEBHOOK";
 
-4. Clique sur "Add Bot"
 
-5. Active :
+==================================================
+7. CRÉER LE BOT DISCORD
+==================================================
 
-   * MESSAGE CONTENT INTENT
+1. Aller sur :
+https://discord.com/developers/applications
 
-6. Copie le TOKEN
+2. Cliquer :
+New Application
 
-7. Invite le bot :
-   OAuth2 → URL Generator :
+3. Onglet Bot → Add Bot
 
-   * bot
-   * permissions :
-     → Send Messages
-     → Read Messages
+4. Copier le TOKEN
 
-============================================================
-8) RÉCUPÉRER L’ID DU SALON
-==========================
+5. Activer :
+- MESSAGE CONTENT INTENT
 
-Dans Discord :
 
-Paramètres → Avancé → activer "Mode développeur"
+==================================================
+8. INVITER LE BOT
+==================================================
 
-Puis clic droit sur ton salon → "Copier l’ID"
+OAuth2 → URL Generator
 
-============================================================
-9) CRÉER LE WEBHOOK
-===================
+Scopes :
+- bot
 
-Dans ton salon Discord :
+Permissions :
+- Send Messages
+- Attach Files
+- Read Messages
 
-Paramètres du salon → Intégrations → Webhooks
+Ouvrir le lien et inviter le bot
 
-Créer un webhook
-Copier l’URL
 
-============================================================
-10) CONFIGURER LE SCRIPT
-========================
+==================================================
+9. CRÉER UN WEBHOOK
+==================================================
 
-Dans ton fichier index.js remplace :
+1. Aller dans ton salon Discord
+2. Paramètres → Intégrations → Webhooks
+3. Créer webhook
+4. Copier l’URL
 
-* DISCORD_TOKEN
-* DISCORD_CHANNEL_ID
-* WEBHOOK_URL
+Mettre dans le script :
+const WEBHOOK_URL = "ICI"
 
-Optionnel :
 
-* bannedWords
-* userProfiles (photos dans ./pp)
+==================================================
+10. RÉCUPÉRER L’ID DU SALON
+==================================================
 
-============================================================
-11) LANCER LE BOT
-=================
+1. Paramètres Discord → Avancé
+2. Activer mode développeur
+3. Clic droit salon → Copier l’ID
+
+
+==================================================
+11. LANCER LE BOT
+==================================================
 
 node index.js
 
-============================================================
-12) CONNECTER WHATSAPP
-======================
 
-Un QR code va apparaître sur Discord
+==================================================
+12. CONNECTER WHATSAPP
+==================================================
 
-Sur ton téléphone :
+Le bot envoie un QR code sur Discord
 
-WhatsApp → Appareils liés → Lier un appareil
+Sur téléphone :
+WhatsApp → Appareils liés → Ajouter un appareil
 
-Scanne le QR code
+Scanner le QR
 
-============================================================
-13) UTILISATION
-===============
 
-COMMANDES DISCORD :
+==================================================
+13. TEST
+==================================================
 
-!groupes
-→ Liste les groupes WhatsApp
+Envoyer message WhatsApp → Discord
 
-!select 1
-→ Sélectionne le groupe
+Envoyer message Discord → WhatsApp
 
-Ensuite :
 
-* Tout message Discord → WhatsApp
-* Tout message WhatsApp → Discord
+==================================================
+14. AJOUTER DES PHOTOS DE PROFIL
+==================================================
 
-============================================================
-14) FONCTIONNALITÉS
-===================
+Mettre images dans le dossier :
 
-✔ Messages texte bidirectionnels
-✔ Images / vidéos / fichiers
-✔ Photos de profil via webhook
-✔ Système de réponse (reply)
-✔ Logs dans latest.log
-✔ Filtre de mots
+./pp/
 
-============================================================
-15) ERREURS COURANTES
-=====================
+Exemple :
 
-BOT NE SE CONNECTE PAS :
-→ Vérifie le TOKEN
+./pp/user1.png
+./pp/user2.png
 
-QR NE S’AFFICHE PAS :
-→ Vérifie l’ID du salon
+Dans le script :
 
-WHATSAPP NE RÉPOND PAS :
-→ Vérifie que tu as sélectionné un groupe (!select)
+const userProfiles = {
+  "33600000001@c.us": "./pp/user1.png"
+};
 
-WEBHOOK NE MARCHE PAS :
-→ Vérifie l’URL
 
-============================================================
-16) LANCEMENT AUTOMATIQUE (OPTIONNEL)
-=====================================
+==================================================
+15. PROBLÈMES COURANTS
+==================================================
 
-Installer pm2 :
+QR code ne s’affiche pas :
+- Vérifier ID du salon
+- Vérifier permissions du bot
+
+Bot ne répond pas :
+- Vérifier token
+- Relancer node index.js
+
+WhatsApp bug :
+rm -rf .wwebjs_auth
+
+Puis relancer
+
+
+==================================================
+16. BONUS (OPTIONNEL)
+==================================================
+
+Installer PM2 :
 
 npm install -g pm2
 
-Lancer le bot :
+Lancer le bot en continu :
 
 pm2 start index.js
-
-Auto start :
-
-pm2 startup
 pm2 save
+pm2 startup
 
-============================================================
-FIN
-===
+
+==================================================
+FIN DU TUTO
+==================================================

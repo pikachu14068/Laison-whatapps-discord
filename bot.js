@@ -16,11 +16,11 @@ const discordClient = new Client({
   ]
 });
 
-const DISCORD_TOKEN = "";           // <-- MET TON TOKEN
-const DISCORD_CHANNEL_ID = "";      // <-- MET TON ID
+const DISCORD_TOKEN = "";           // <-- TON TOKEN
+const DISCORD_CHANNEL_ID = "";      // <-- TON CHANNEL
 
-// WEBHOOK DISCORD
-const WEBHOOK_URL = "";             // <-- MET TON WEBHOOK
+// WEBHOOK
+const WEBHOOK_URL = "";             // <-- TON WEBHOOK
 const webhook = new WebhookClient({ url: WEBHOOK_URL });
 
 // WhatsApp
@@ -33,10 +33,18 @@ const waClient = new WAClient({
 
 // Dossiers
 const MEDIA_DIR = "./media";
+const PP_DIR = "./pp";
 const LOG_FILE = "./latest.log";
 
+// PP LOCALES PAR NUMÉRO
+const userProfiles = {
+  "33600000001@c.us": `${PP_DIR}/user1.png`,
+  "33600000002@c.us": `${PP_DIR}/user2.png`,
+  "33600000003@c.us": `${PP_DIR}/user3.png`
+};
+
 // Filtrage
-const bannedWords = []; // <-- ajoute tes mots si tu veux
+const bannedWords = [];
 
 // ================= ETATS =================
 let waReady = false;
@@ -86,6 +94,10 @@ waClient.on("message", async (msg) => {
 
   if(!waReady) return;
 
+  // 🔒 FILTRES
+  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return;
+  if (msg.type !== "chat" && !msg.hasMedia) return;
+
   const msgId = msg.id._serialized;
 
   if(sentMessages.has(msgId)){
@@ -95,6 +107,7 @@ waClient.on("message", async (msg) => {
 
   const contact = await msg.getContact();
   const name = contact.pushname || contact.number;
+  const number = msg.from;
 
   if(bannedWords.some(w => msg.body?.toLowerCase().includes(w))) return;
 
@@ -102,21 +115,24 @@ waClient.on("message", async (msg) => {
 
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
-    // PP WhatsApp auto
-    let avatar = null;
-    try{
-      avatar = await contact.getProfilePicUrl();
-    }catch{}
+    let files = [];
 
-    // Reply
+    // ===== PP LOCALE =====
+    if(userProfiles[number]){
+      files.push({
+        attachment: userProfiles[number],
+        name: "pp.png"
+      });
+    }
+
+    // ===== REPLY =====
     let content = msg.body || "";
     if(msg.hasQuotedMsg){
       const quoted = await msg.getQuotedMessage();
       content = `💬 Réponse à : ${quoted.body}\n${content}`;
     }
 
-    // Médias
-    let files = [];
+    // ===== MÉDIAS =====
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
 
@@ -131,7 +147,6 @@ waClient.on("message", async (msg) => {
 
     await webhook.send({
       username: name,
-      avatarURL: avatar || undefined,
       content: content || " ",
       files: files
     });
@@ -198,7 +213,7 @@ discordClient.on("messageCreate", async (message) => {
       text = `${name} : ${message.content}`;
     }
 
-    // Reply Discord
+    // Reply
     if(message.reference){
       try{
         const replied = await message.channel.messages.fetch(message.reference.messageId);
@@ -236,5 +251,6 @@ discordClient.on("messageCreate", async (message) => {
 
 // ================= INIT =================
 if(!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR);
+if(!fs.existsSync(PP_DIR)) fs.mkdirSync(PP_DIR);
 
 waClient.initialize();
