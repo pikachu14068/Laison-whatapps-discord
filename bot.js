@@ -7,7 +7,7 @@ const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 
 // ================= VARIABLES =================
 
-// Discord BOT
+// Discord
 const discordClient = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -18,9 +18,8 @@ const discordClient = new Client({
 
 const DISCORD_TOKEN = "";           // <-- TON TOKEN
 const DISCORD_CHANNEL_ID = "";      // <-- TON CHANNEL
-
-// WEBHOOK
 const WEBHOOK_URL = "";             // <-- TON WEBHOOK
+
 const webhook = new WebhookClient({ url: WEBHOOK_URL });
 
 // WhatsApp
@@ -36,11 +35,9 @@ const MEDIA_DIR = "./media";
 const PP_DIR = "./pp";
 const LOG_FILE = "./latest.log";
 
-// PP LOCALES PAR NUMÉRO
+// PP LOCALES
 const userProfiles = {
-  "33600000001@c.us": `${PP_DIR}/user1.png`,
-  "33600000002@c.us": `${PP_DIR}/user2.png`,
-  "33600000003@c.us": `${PP_DIR}/user3.png`
+  "33600000001@c.us": `${PP_DIR}/user1.png`
 };
 
 // Filtrage
@@ -49,7 +46,9 @@ const bannedWords = [];
 // ================= ETATS =================
 let waReady = false;
 let selectedGroup = null;
+
 const sentMessages = new Set();
+const messageMapDiscordToWA = new Map();
 
 // ================= LOG =================
 function logMessage(source, user, content){
@@ -94,16 +93,13 @@ waClient.on("message", async (msg) => {
 
   if(!waReady) return;
 
-  // 🔒 Filtrage de base
-  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return; // privé + statut
-  if (msg.type !== "chat" && !msg.hasMedia) return; // messages système
-
-  // 🔥 Filtre groupe sélectionné
+  // 🔒 filtres
+  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return;
+  if (msg.type !== "chat" && !msg.hasMedia) return;
   if (selectedGroup && msg.from !== selectedGroup.id._serialized) return;
 
   const msgId = msg.id._serialized;
 
-  // anti-boucle
   if(sentMessages.has(msgId)){
     sentMessages.delete(msgId);
     return;
@@ -113,16 +109,15 @@ waClient.on("message", async (msg) => {
   const name = contact.pushname || contact.number;
   const number = msg.from;
 
-  // Filtre mots interdits
   if(bannedWords.some(w => msg.body?.toLowerCase().includes(w))) return;
 
   try{
-    // Log
+
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
     let files = [];
 
-    // ===== PP LOCALE =====
+    // PP locale
     if(userProfiles[number]){
       files.push({
         attachment: userProfiles[number],
@@ -130,26 +125,24 @@ waClient.on("message", async (msg) => {
       });
     }
 
-    // ===== REPLY =====
+    // reply (affichage simple côté Discord)
     let content = msg.body || "";
     if(msg.hasQuotedMsg){
       const quoted = await msg.getQuotedMessage();
       content = `💬 Réponse à : ${quoted.body}\n${content}`;
     }
 
-    // ===== MÉDIAS =====
+    // médias
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
       if(media){
         const ext = media.mimetype.split("/")[1];
         const path = `${MEDIA_DIR}/${Date.now()}.${ext}`;
-
         fs.writeFileSync(path, media.data, "base64");
         files.push(path);
       }
     }
 
-    // ===== ENVOI WEBHOOK =====
     await webhook.send({
       username: name,
       content: content || " ",
@@ -173,7 +166,6 @@ discordClient.on("messageCreate", async (message) => {
   if(bannedWords.some(w => message.content.toLowerCase().includes(w))) return;
 
   // ===== COMMANDES =====
-
   if(message.content.startsWith("!groupes")){
     const chats = await waClient.getChats();
     const groups = chats.filter(c => c.isGroup);
@@ -211,37 +203,47 @@ discordClient.on("messageCreate", async (message) => {
 
     logMessage("DISCORD", name, message.content || "[MEDIA]");
 
-    let text = null;
-
-    // Message normal
-    if(message.content && !message.content.startsWith("!")){
-      text = `${name} : ${message.content}`;
-    }
-
-    // Reply
+    // ===== REPLY DISCORD → WHATSAPP (VRAI) =====
     if(message.reference){
-      try{
-        const replied = await message.channel.messages.fetch(message.reference.messageId);
 
-        text = `💬 ${name} répond à ${replied.author.username} : ${replied.content}\n${name} : ${message.content}`;
+      try{
+        const repliedId = message.reference.messageId;
+
+        if(messageMapDiscordToWA.has(repliedId)){
+          const waMsgId = messageMapDiscordToWA.get(repliedId);
+
+          const sent = await group.sendMessage(
+            `${name} : ${message.content}`,
+            { quotedMessageId: waMsgId }
+          );
+
+          messageMapDiscordToWA.set(message.id, sent.id._serialized);
+          return;
+        }
 
       }catch(e){
-        console.log("Erreur reply Discord :", e);
+        console.log("Erreur reply :", e);
       }
     }
 
-    if(text){
-      const sent = await group.sendMessage(text);
-      sentMessages.add(sent.id._serialized);
+    // ===== MESSAGE NORMAL =====
+    let sentMsg = null;
+
+    if(message.content && !message.content.startsWith("!")){
+      sentMsg = await group.sendMessage(`${name} : ${message.content}`);
     }
 
-    // Médias
+    if(sentMsg){
+      messageMapDiscordToWA.set(message.id, sentMsg.id._serialized);
+    }
+
+    // ===== MÉDIAS =====
     if(message.attachments.size > 0){
       for(const att of message.attachments.values()){
         try{
           const media = await MessageMedia.fromUrl(att.url);
           const sent = await group.sendMessage(media);
-          sentMessages.add(sent.id._serialized);
+          messageMapDiscordToWA.set(message.id, sent.id._serialized);
         }catch(e){
           console.log("Erreur média :", e);
         }
