@@ -5,9 +5,21 @@ const fetch = require("node-fetch");
 const { Client, GatewayIntentBits, WebhookClient } = require("discord.js");
 const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
-// ================= VARIABLES =================
+// ================= CONFIG =================
 
-// Discord
+const DISCORD_TOKEN = "TON_TOKEN";
+const DISCORD_CHANNEL_ID = "TON_CHANNEL_ID";
+const WEBHOOK_URL = "TON_WEBHOOK_URL";
+
+const MEDIA_DIR = "./media";
+const LOG_FILE = "./latest.log";
+
+// ================= INIT =================
+
+if(!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR);
+
+const webhook = new WebhookClient({ url: WEBHOOK_URL });
+
 const discordClient = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -16,13 +28,6 @@ const discordClient = new Client({
   ]
 });
 
-const DISCORD_TOKEN = "";           // <-- TON TOKEN
-const DISCORD_CHANNEL_ID = "";      // <-- TON CHANNEL
-const WEBHOOK_URL = "";             // <-- TON WEBHOOK
-
-const webhook = new WebhookClient({ url: WEBHOOK_URL });
-
-// WhatsApp
 const waClient = new WAClient({
   authStrategy: new LocalAuth(),
   puppeteer: {
@@ -30,73 +35,62 @@ const waClient = new WAClient({
   }
 });
 
-// Dossiers
-const MEDIA_DIR = "./media";
-const PP_DIR = "./pp";
-const LOG_FILE = "./latest.log";
+// ================= VARIABLES =================
 
-// PP LOCALES
-const userProfiles = {
-  "33600000001@c.us": `${PP_DIR}/user1.png`
-};
-
-// Filtrage
-const bannedWords = [];
-
-// ================= ETATS =================
 let waReady = false;
-let selectedGroup = null;
+let selectedGroupId = null;
 
 const sentMessages = new Set();
-const messageMapDiscordToWA = new Map();
+const messageMap = new Map(); // Discord <-> WA
 
 // ================= LOG =================
+
 function logMessage(source, user, content){
   const time = new Date().toLocaleString();
   fs.appendFileSync(LOG_FILE, `[${time}] ${source} | ${user} -> ${content}\n`);
 }
 
 // ================= DISCORD =================
+
 discordClient.on("ready", () => {
-  console.log("✅ Discord connecté");
+  console.log("✅ Discord prêt");
 });
+
 discordClient.login(DISCORD_TOKEN);
 
-// ================= WHATSAPP =================
+// ================= QR =================
+
+waClient.on("qr", async (qr) => {
+  const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+
+  const qrImage = await qrcode.toDataURL(qr);
+  const base64 = qrImage.replace(/^data:image\/png;base64,/, "");
+
+  fs.writeFileSync("qr.png", base64, "base64");
+
+  await channel.send({
+    content: "📱 Scan le QR code WhatsApp",
+    files: ["qr.png"]
+  });
+});
+
+// ================= READY =================
+
 waClient.on("ready", () => {
   console.log("✅ WhatsApp prêt");
   waReady = true;
 });
 
-// ================= QR =================
-waClient.on("qr", async (qr) => {
-  try{
-    const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+// ================= WA → DISCORD =================
 
-    const qrImage = await qrcode.toDataURL(qr);
-    const base64 = qrImage.replace(/^data:image\/png;base64,/, "");
-
-    fs.writeFileSync("qr.png", base64, "base64");
-
-    await channel.send({
-      content: "📱 Scan le QR code WhatsApp :",
-      files: ["qr.png"]
-    });
-
-  }catch(e){
-    console.log("Erreur QR :", e);
-  }
-});
-
-// ================= WHATSAPP → DISCORD =================
 waClient.on("message", async (msg) => {
 
   if(!waReady) return;
 
-  // 🔒 filtres
-  if (!msg.from.endsWith("@g.us") || msg.from === "status@broadcast") return;
-  if (msg.type !== "chat" && !msg.hasMedia) return;
-  if (selectedGroup && msg.from !== selectedGroup.id._serialized) return;
+  if(!msg.from.endsWith("@g.us")) return;
+
+  // 🔥 filtre groupe sélectionné
+  if(selectedGroupId && msg.from !== selectedGroupId) return;
 
   const msgId = msg.id._serialized;
 
@@ -107,55 +101,59 @@ waClient.on("message", async (msg) => {
 
   const contact = await msg.getContact();
   const name = contact.pushname || contact.number;
-  const number = msg.from;
 
-  if(bannedWords.some(w => msg.body?.toLowerCase().includes(w))) return;
-
-  try{
+  try {
 
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
-    let files = [];
+    let content = msg.body || " ";
 
-    // PP locale
-    if(userProfiles[number]){
-      files.push({
-        attachment: userProfiles[number],
-        name: "pp.png"
-      });
-    }
+    // ===== REPLY =====
+    let replyTo = null;
 
-    // reply (affichage simple côté Discord)
-    let content = msg.body || "";
     if(msg.hasQuotedMsg){
       const quoted = await msg.getQuotedMessage();
-      content = `💬 Réponse à : ${quoted.body}\n${content}`;
+
+      for(const [discordId, waId] of messageMap.entries()){
+        if(waId === quoted.id._serialized){
+          replyTo = discordId;
+          break;
+        }
+      }
     }
 
-    // médias
+    let files = [];
+
+    // ===== MEDIA =====
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
+
       if(media){
         const ext = media.mimetype.split("/")[1];
         const path = `${MEDIA_DIR}/${Date.now()}.${ext}`;
+
         fs.writeFileSync(path, media.data, "base64");
         files.push(path);
       }
     }
 
-    await webhook.send({
+    const sent = await webhook.send({
       username: name,
-      content: content || " ",
+      content: content,
       files: files
     });
 
-  }catch(e){
+    // map
+    messageMap.set(sent.id, msgId);
+
+  } catch(e){
     console.log("Erreur WA → Discord :", e);
   }
 
 });
 
 // ================= DISCORD → WHATSAPP =================
+
 discordClient.on("messageCreate", async (message) => {
 
   if(message.author.bot) return;
@@ -163,14 +161,13 @@ discordClient.on("messageCreate", async (message) => {
 
   const name = message.member?.displayName || message.author.username;
 
-  if(bannedWords.some(w => message.content.toLowerCase().includes(w))) return;
-
   // ===== COMMANDES =====
-  if(message.content.startsWith("!groupes")){
+
+  if(message.content === "!groupes"){
     const chats = await waClient.getChats();
     const groups = chats.filter(c => c.isGroup);
 
-    let txt = "📋 Groupes :\n";
+    let txt = "📂 Groupes :\n";
     groups.forEach((g,i)=> txt += `${i+1}. ${g.name}\n`);
 
     await message.reply(txt);
@@ -189,44 +186,43 @@ discordClient.on("messageCreate", async (message) => {
       return;
     }
 
-    selectedGroup = groups[index];
-    await message.reply(`✅ Groupe : ${selectedGroup.name}`);
+    selectedGroupId = groups[index].id._serialized;
+
+    await message.reply(`✅ Groupe sélectionné : ${groups[index].name}`);
     return;
   }
 
-  try{
+  // ===== ENVOI =====
+
+  try {
 
     const chats = await waClient.getChats();
-    const group = selectedGroup || chats.find(c => c.isGroup);
+    const group = chats.find(c => c.id._serialized === selectedGroupId) || chats.find(c => c.isGroup);
 
     if(!group) return;
 
     logMessage("DISCORD", name, message.content || "[MEDIA]");
 
-    // ===== REPLY DISCORD → WHATSAPP (VRAI) =====
+    // ===== REPLY =====
+
     if(message.reference){
+      const repliedId = message.reference.messageId;
 
-      try{
-        const repliedId = message.reference.messageId;
+      if(messageMap.has(repliedId)){
+        const waMsgId = messageMap.get(repliedId);
 
-        if(messageMapDiscordToWA.has(repliedId)){
-          const waMsgId = messageMapDiscordToWA.get(repliedId);
+        const sent = await group.sendMessage(
+          `${name} : ${message.content}`,
+          { quotedMessageId: waMsgId }
+        );
 
-          const sent = await group.sendMessage(
-            `${name} : ${message.content}`,
-            { quotedMessageId: waMsgId }
-          );
-
-          messageMapDiscordToWA.set(message.id, sent.id._serialized);
-          return;
-        }
-
-      }catch(e){
-        console.log("Erreur reply :", e);
+        messageMap.set(message.id, sent.id._serialized);
+        return;
       }
     }
 
-    // ===== MESSAGE NORMAL =====
+    // ===== TEXTE =====
+
     let sentMsg = null;
 
     if(message.content && !message.content.startsWith("!")){
@@ -234,30 +230,35 @@ discordClient.on("messageCreate", async (message) => {
     }
 
     if(sentMsg){
-      messageMapDiscordToWA.set(message.id, sentMsg.id._serialized);
+      messageMap.set(message.id, sentMsg.id._serialized);
     }
 
-    // ===== MÉDIAS =====
+    // ===== MEDIA =====
+
     if(message.attachments.size > 0){
       for(const att of message.attachments.values()){
         try{
           const media = await MessageMedia.fromUrl(att.url);
+
           const sent = await group.sendMessage(media);
-          messageMapDiscordToWA.set(message.id, sent.id._serialized);
+
+          messageMap.set(message.id, sent.id._serialized);
+
+          const buffer = await (await fetch(att.url)).arrayBuffer();
+          fs.writeFileSync(`${MEDIA_DIR}/${Date.now()}`, Buffer.from(buffer));
+
         }catch(e){
           console.log("Erreur média :", e);
         }
       }
     }
 
-  }catch(e){
+  } catch(e){
     console.log("Erreur Discord → WhatsApp :", e);
   }
 
 });
 
-// ================= INIT =================
-if(!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR);
-if(!fs.existsSync(PP_DIR)) fs.mkdirSync(PP_DIR);
+// ================= START =================
 
 waClient.initialize();
