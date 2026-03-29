@@ -41,7 +41,7 @@ let waReady = false;
 let selectedGroupId = null;
 
 const sentMessages = new Set();
-const messageMap = new Map(); // Discord <-> WA
+const messageMap = new Map();
 
 // ================= LOG =================
 
@@ -86,10 +86,7 @@ waClient.on("ready", () => {
 waClient.on("message", async (msg) => {
 
   if(!waReady) return;
-
   if(!msg.from.endsWith("@g.us")) return;
-
-  // 🔥 filtre groupe sélectionné
   if(selectedGroupId && msg.from !== selectedGroupId) return;
 
   const msgId = msg.id._serialized;
@@ -106,34 +103,31 @@ waClient.on("message", async (msg) => {
 
     logMessage("WHATSAPP", name, msg.body || "[MEDIA]");
 
-    let content = msg.body || " ";
-
-    // ===== REPLY =====
-    let replyTo = null;
-
-    if(msg.hasQuotedMsg){
-      const quoted = await msg.getQuotedMessage();
-
-      for(const [discordId, waId] of messageMap.entries()){
-        if(waId === quoted.id._serialized){
-          replyTo = discordId;
-          break;
-        }
-      }
-    }
-
     let files = [];
+    let content = msg.body || " ";
 
     // ===== MEDIA =====
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
 
       if(media){
-        const ext = media.mimetype.split("/")[1];
-        const path = `${MEDIA_DIR}/${Date.now()}.${ext}`;
+
+        let ext = media.mimetype.split("/")[1];
+
+        // 🔥 FIX VOCAL → .ogg
+        if(msg.type === "ptt"){
+          ext = "ogg";
+        }
+
+        const filename = `${Date.now()}.${ext}`;
+        const path = `${MEDIA_DIR}/${filename}`;
 
         fs.writeFileSync(path, media.data, "base64");
-        files.push(path);
+
+        files.push({
+          attachment: path,
+          name: filename
+        });
       }
     }
 
@@ -143,7 +137,6 @@ waClient.on("message", async (msg) => {
       files: files
     });
 
-    // map
     messageMap.set(sent.id, msgId);
 
   } catch(e){
@@ -202,26 +195,6 @@ discordClient.on("messageCreate", async (message) => {
     if(!group) return;
 
     logMessage("DISCORD", name, message.content || "[MEDIA]");
-
-    // ===== REPLY =====
-
-    if(message.reference){
-      const repliedId = message.reference.messageId;
-
-      if(messageMap.has(repliedId)){
-        const waMsgId = messageMap.get(repliedId);
-
-        const sent = await group.sendMessage(
-          `${name} : ${message.content}`,
-          { quotedMessageId: waMsgId }
-        );
-
-        messageMap.set(message.id, sent.id._serialized);
-        return;
-      }
-    }
-
-    // ===== TEXTE =====
 
     let sentMsg = null;
 
