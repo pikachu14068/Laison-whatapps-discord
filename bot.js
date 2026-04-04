@@ -7,9 +7,9 @@ const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 
 // ================= CONFIG =================
 
-const DISCORD_TOKEN = "TON_TOKEN";
-const DISCORD_CHANNEL_ID = "TON_CHANNEL_ID";
-const WEBHOOK_URL = "TON_WEBHOOK_URL";
+const DISCORD_TOKEN = "ton bot token";
+const DISCORD_CHANNEL_ID = "Ton chanelle id";
+const WEBHOOK_URL = "Ton webhook url";
 
 const MEDIA_DIR = "./media";
 const LOG_FILE = "./latest.log";
@@ -109,32 +109,32 @@ waClient.on("message", async (msg) => {
     // ===== MEDIA =====
     if(msg.hasMedia){
       const media = await msg.downloadMedia();
-
       if(media){
-
         let ext = media.mimetype.split("/")[1];
-
-        // 🔥 FIX VOCAL → .ogg
-        if(msg.type === "ptt"){
-          ext = "ogg";
-        }
-
+        if(msg.type === "ptt") ext = "ogg";
         const filename = `${Date.now()}.${ext}`;
         const path = `${MEDIA_DIR}/${filename}`;
-
         fs.writeFileSync(path, media.data, "base64");
 
-        files.push({
-          attachment: path,
-          name: filename
-        });
+        files.push({ attachment: path, name: filename });
+      }
+    }
+
+    // ===== REPLY =====
+    let replyOptions = {};
+    if(msg.hasQuotedMsg){
+      const quotedMsg = await msg.getQuotedMessage();
+      const quotedDiscordId = messageMap.get(quotedMsg.id._serialized);
+      if(quotedDiscordId){
+        replyOptions = { reply: { messageReference: quotedDiscordId } };
       }
     }
 
     const sent = await webhook.send({
       username: name,
       content: content,
-      files: files
+      files: files,
+      ...replyOptions
     });
 
     messageMap.set(sent.id, msgId);
@@ -145,7 +145,33 @@ waClient.on("message", async (msg) => {
 
 });
 
-// ================= DISCORD → WHATSAPP =================
+// ================= WA MESSAGE UPDATE =================
+
+waClient.on("message_update", async (msg) => {
+  const discordId = messageMap.get(msg.id._serialized);
+  if(!discordId) return;
+
+  const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+  const discordMsg = await channel.messages.fetch(discordId);
+
+  const contact = await msg.getContact();
+  const name = contact.pushname || contact.number;
+
+  await discordMsg.edit(`${name} : ${msg.body || "[MEDIA]"} (édité)`);
+});
+
+// ================= WA MESSAGE DELETE =================
+
+waClient.on("message_revoke_everyone", async (msg) => {
+  const discordId = messageMap.get(msg.id._serialized);
+  if(!discordId) return;
+
+  const channel = await discordClient.channels.fetch(DISCORD_CHANNEL_ID);
+  const discordMsg = await channel.messages.fetch(discordId);
+  await discordMsg.delete();
+});
+
+// ================= DISCORD → WA =================
 
 discordClient.on("messageCreate", async (message) => {
 
@@ -155,12 +181,11 @@ discordClient.on("messageCreate", async (message) => {
   const name = message.member?.displayName || message.author.username;
 
   // ===== COMMANDES =====
-
   if(message.content === "!groupes"){
     const chats = await waClient.getChats();
     const groups = chats.filter(c => c.isGroup);
 
-    let txt = "📂 Groupes :\n";
+    let txt = "📋 Groupes :\n";
     groups.forEach((g,i)=> txt += `${i+1}. ${g.name}\n`);
 
     await message.reply(txt);
@@ -180,7 +205,6 @@ discordClient.on("messageCreate", async (message) => {
     }
 
     selectedGroupId = groups[index].id._serialized;
-
     await message.reply(`✅ Groupe sélectionné : ${groups[index].name}`);
     return;
   }
@@ -191,29 +215,31 @@ discordClient.on("messageCreate", async (message) => {
 
     const chats = await waClient.getChats();
     const group = chats.find(c => c.id._serialized === selectedGroupId) || chats.find(c => c.isGroup);
-
     if(!group) return;
 
     logMessage("DISCORD", name, message.content || "[MEDIA]");
 
-    let sentMsg = null;
-
-    if(message.content && !message.content.startsWith("!")){
-      sentMsg = await group.sendMessage(`${name} : ${message.content}`);
+    // ===== REPLY =====
+    let replyOptions = {};
+    if(message.reference?.messageId){
+      const repliedWaId = messageMap.get(message.reference.messageId);
+      if(repliedWaId){
+        replyOptions = { quotedMessageId: repliedWaId };
+      }
     }
 
-    if(sentMsg){
-      messageMap.set(message.id, sentMsg.id._serialized);
+    let sentMsg = null;
+    if(message.content && !message.content.startsWith("!")){
+      sentMsg = await group.sendMessage(`${name} : ${message.content}`, replyOptions);
+      if(sentMsg) messageMap.set(message.id, sentMsg.id._serialized);
     }
 
     // ===== MEDIA =====
-
     if(message.attachments.size > 0){
       for(const att of message.attachments.values()){
         try{
           const media = await MessageMedia.fromUrl(att.url);
-
-          const sent = await group.sendMessage(media);
+          const sent = await group.sendMessage(media, replyOptions);
 
           messageMap.set(message.id, sent.id._serialized);
 
@@ -227,9 +253,44 @@ discordClient.on("messageCreate", async (message) => {
     }
 
   } catch(e){
-    console.log("Erreur Discord → WhatsApp :", e);
+    console.log("Erreur Discord → WA :", e);
   }
 
+});
+
+// ================= DISCORD UPDATE =================
+
+discordClient.on("messageUpdate", async (oldMessage, newMessage) => {
+  if(newMessage.author.bot) return;
+  const waId = messageMap.get(newMessage.id);
+  if(!waId) return;
+
+  const chats = await waClient.getChats();
+  const group = chats.find(c => c.id._serialized === selectedGroupId) || chats.find(c => c.isGroup);
+  if(!group) return;
+
+  const waMsg = await group.fetchMessages({ limit: 50 });
+  const msgToEdit = waMsg.find(m => m.id._serialized === waId);
+  if(msgToEdit){
+    await msgToEdit.edit(newMessage.content);
+  }
+});
+
+// ================= DISCORD DELETE =================
+
+discordClient.on("messageDelete", async (message) => {
+  const waId = messageMap.get(message.id);
+  if(!waId) return;
+
+  const chats = await waClient.getChats();
+  const group = chats.find(c => c.id._serialized === selectedGroupId) || chats.find(c => c.isGroup);
+  if(!group) return;
+
+  const waMsg = await group.fetchMessages({ limit: 50 });
+  const msgToDelete = waMsg.find(m => m.id._serialized === waId);
+  if(msgToDelete){
+    await msgToDelete.delete(true);
+  }
 });
 
 // ================= START =================
