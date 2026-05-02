@@ -1,4 +1,6 @@
 const fs = require("fs");
+const http = require("http");
+const path = require("path");
 const qrcode = require("qrcode");
 const fetch = require("node-fetch");
 
@@ -7,12 +9,16 @@ const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 
 // ================= CONFIG =================
 
-const DISCORD_TOKEN      = "Ton token discord";
-const DISCORD_CHANNEL_ID = "Ton channel ID";
-const WEBHOOK_URL        = "Ton webhook URL";
+const DISCORD_TOKEN      = "tok token";
+const DISCORD_CHANNEL_ID = "ton chanelle id";
+const WEBHOOK_URL        = "ton webhook url";
 
-const MEDIA_DIR = "./media";
-const LOG_FILE  = "./bridge.log";
+const SERVER_IP   = "ton ip";
+const SERVER_PORT = ton_port-ici;
+
+const MEDIA_DIR  = "./media";
+const AVATAR_DIR = "./avatars";
+const LOG_FILE   = "./bridge.log";
 
 // ================= CHROMIUM =================
 
@@ -30,13 +36,34 @@ function findChromium() {
       return p;
     }
   }
-  console.warn("Chromium non trouve, utilisation du bundled puppeteer");
   return undefined;
 }
 
+// ================= SERVEUR HTTP AVATARS =================
+
+http.createServer((req, res) => {
+  const basename = path.basename(req.url);
+  if (!basename || basename === "." || basename === "/") {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+  const filepath = path.join(__dirname, "avatars", basename);
+  if (!fs.existsSync(filepath) || fs.statSync(filepath).isDirectory()) {
+    res.writeHead(404);
+    res.end();
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "image/jpeg" });
+  fs.createReadStream(filepath).pipe(res);
+}).listen(SERVER_PORT, () => {
+  console.log("Serveur avatars port " + SERVER_PORT);
+});
+
 // ================= INIT =================
 
-if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+if (!fs.existsSync(MEDIA_DIR))  fs.mkdirSync(MEDIA_DIR,  { recursive: true });
+if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
 const webhook = new WebhookClient({ url: WEBHOOK_URL });
 
@@ -65,7 +92,7 @@ const waClient = new WAClient({
 
 let waReady         = false;
 let selectedGroupId = null;
-let startTimestamp  = Math.floor(Date.now() / 1000); // timestamp UNIX au démarrage
+let startTimestamp  = Math.floor(Date.now() / 1000);
 
 const waToDiscord  = new Map();
 const discordToWa  = new Map();
@@ -100,14 +127,43 @@ async function getSelectedGroup() {
   return chats.find((c) => c.id._serialized === selectedGroupId) || null;
 }
 
-async function getAvatar(contact) {
+// Priorit� : nom que TU as donn� au contact > pushname WA > num�ro
+function getContactName(contact) {
+  return contact.name || contact.pushname || contact.number || "Inconnu";
+}
+
+// T�l�charge l'avatar via puppeteer et retourne une URL publique
+async function getAvatarUrl(contact) {
   const id = contact.id._serialized;
   if (avatarCache.has(id)) return avatarCache.get(id);
+
   try {
-    const url = await contact.getProfilePicUrl();
-    avatarCache.set(id, url || null);
-    return url || null;
-  } catch (_) {
+    const picUrl = await contact.getProfilePicUrl();
+    if (!picUrl) { avatarCache.set(id, null); return null; }
+
+    const page   = waClient.pupPage;
+    const buffer = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const ab  = await res.arrayBuffer();
+        return Array.from(new Uint8Array(ab));
+      } catch (_) { return null; }
+    }, picUrl);
+
+    if (!buffer || buffer.length === 0) { avatarCache.set(id, null); return null; }
+
+    const filename = id.replace(/[^a-zA-Z0-9]/g, "_") + ".jpg";
+    const filepath = AVATAR_DIR + "/" + filename;
+    fs.writeFileSync(filepath, Buffer.from(buffer));
+
+    const publicUrl = "http://" + SERVER_IP + ":" + SERVER_PORT + "/" + filename;
+    console.log("Avatar OK : " + publicUrl);
+    avatarCache.set(id, publicUrl);
+    return publicUrl;
+
+  } catch (e) {
+    console.error("Erreur avatar :", e.message);
     avatarCache.set(id, null);
     return null;
   }
@@ -121,9 +177,7 @@ async function buildReplyPrefix(quotedDiscordId) {
     const author   = original.author.username;
     const preview  = (original.content || "[MEDIA]").split("\n")[0].slice(0, 80);
     return "> **" + author + "** : " + preview + "\n";
-  } catch (_) {
-    return "";
-  }
+  } catch (_) { return ""; }
 }
 
 // ================= DISCORD =================
@@ -142,13 +196,8 @@ waClient.on("qr", async (qr) => {
     const base64  = dataUrl.replace(/^data:image\/png;base64,/, "");
     fs.writeFileSync("qr.png", base64, "base64");
     const channel = await getDiscordChannel();
-    await channel.send({
-      content: "Scanne ce QR code pour connecter WhatsApp",
-      files: ["qr.png"],
-    });
-  } catch (e) {
-    console.error("Erreur envoi QR :", e.message);
-  }
+    await channel.send({ content: "Scanne ce QR code pour connecter WhatsApp", files: ["qr.png"] });
+  } catch (e) { console.error("Erreur QR :", e.message); }
 });
 
 // ================= WHATSAPP : READY =================
@@ -156,7 +205,7 @@ waClient.on("qr", async (qr) => {
 waClient.on("ready", async () => {
   console.log("WhatsApp connecte");
   await new Promise((r) => setTimeout(r, 5000));
-  startTimestamp = Math.floor(Date.now() / 1000); // ignorer tout ce qui est avant ce moment
+  startTimestamp = Math.floor(Date.now() / 1000);
   waReady = true;
   console.log("WhatsApp pret");
 });
@@ -176,22 +225,16 @@ waClient.on("message", async (msg) => {
   if (!waReady) return;
   if (!msg.from.endsWith("@g.us")) return;
   if (selectedGroupId && msg.from !== selectedGroupId) return;
-
-  // Ignorer les messages envoyés avant le démarrage du bot
   if (msg.timestamp < startTimestamp) return;
 
   const waId = msg.id._serialized;
-
-  if (sentByBridge.has(waId)) {
-    sentByBridge.delete(waId);
-    return;
-  }
+  if (sentByBridge.has(waId)) { sentByBridge.delete(waId); return; }
 
   try {
     const contact   = await msg.getContact();
-    const name      = contact.pushname || contact.name || contact.number || "Inconnu";
+    const name      = getContactName(contact);
     const text      = msg.body || "";
-    const avatarUrl = await getAvatar(contact);
+    const avatarUrl = await getAvatarUrl(contact);
 
     log("WA->DC", name, text || "[MEDIA]");
 
@@ -203,9 +246,7 @@ waClient.on("message", async (msg) => {
           const { filename, filepath } = saveMedia(media.data, media.mimetype, msg.type);
           files.push({ attachment: filepath, name: filename });
         }
-      } catch (e) {
-        console.error("Erreur download media :", e.message);
-      }
+      } catch (e) { console.error("Erreur media :", e.message); }
     }
 
     let replyPrefix = "";
@@ -230,9 +271,7 @@ waClient.on("message", async (msg) => {
     waToDiscord.set(waId, sent.id);
     discordToWa.set(sent.id, waId);
 
-  } catch (e) {
-    console.error("Erreur WA->DC :", e.message);
-  }
+  } catch (e) { console.error("Erreur WA->DC :", e.message); }
 });
 
 // ================= WHATSAPP : EDITION =================
@@ -242,13 +281,11 @@ waClient.on("message_edit", async (msg) => {
   if (!discordId) return;
   try {
     const contact = await msg.getContact();
-    const name    = contact.pushname || contact.name || contact.number || "Inconnu";
+    const name    = getContactName(contact);
     const channel = await getDiscordChannel();
     const dMsg    = await channel.messages.fetch(discordId);
     await dMsg.edit(name + " : " + (msg.body || "[MEDIA]") + " *(edite)*");
-  } catch (e) {
-    console.error("Erreur edition WA->DC :", e.message);
-  }
+  } catch (e) { console.error("Erreur edition WA->DC :", e.message); }
 });
 
 // ================= WHATSAPP : SUPPRESSION =================
@@ -261,9 +298,7 @@ waClient.on("message_revoke_everyone", async (_, revokedMsg) => {
     const channel = await getDiscordChannel();
     const dMsg    = await channel.messages.fetch(discordId);
     await dMsg.delete();
-  } catch (e) {
-    console.error("Erreur suppression WA->DC :", e.message);
-  }
+  } catch (e) { console.error("Erreur suppression WA->DC :", e.message); }
 });
 
 // ================= DISCORD -> WHATSAPP =================
@@ -275,8 +310,6 @@ discordClient.on("messageCreate", async (message) => {
 
   const name    = message.member ? message.member.displayName : message.author.username;
   const content = message.content;
-
-  // ===== COMMANDES =====
 
   if (content === "!groupes") {
     const chats  = await waClient.getChats();
@@ -293,7 +326,7 @@ discordClient.on("messageCreate", async (message) => {
     const chats  = await waClient.getChats();
     const groups = chats.filter((c) => c.isGroup);
     if (isNaN(index) || !groups[index]) {
-      await message.reply("Numero invalide. Utilise !groupes pour voir la liste.");
+      await message.reply("Numero invalide. Utilise !groupes.");
       return;
     }
     selectedGroupId = groups[index].id._serialized;
@@ -313,22 +346,17 @@ discordClient.on("messageCreate", async (message) => {
 
   if (content === "!help") {
     await message.reply(
-      "Commandes disponibles :\n" +
-      "!groupes — Liste les groupes WhatsApp\n" +
-      "!select <numero> — Selectionne un groupe\n" +
-      "!status — Etat de la connexion\n" +
-      "!help — Cette aide"
+      "Commandes :\n" +
+      "!groupes � Liste les groupes\n" +
+      "!select <n> � Selectionne un groupe\n" +
+      "!status � Etat connexion\n" +
+      "!help � Cette aide"
     );
     return;
   }
 
-  // ===== ENVOI VERS WHATSAPP =====
-
   const group = await getSelectedGroup();
-  if (!group) {
-    await message.reply("Aucun groupe selectionne. Utilise !select <numero>.");
-    return;
-  }
+  if (!group) { await message.reply("Aucun groupe selectionne. Utilise !select <n>."); return; }
 
   try {
     log("DC->WA", name, content || "[MEDIA]");
@@ -357,14 +385,10 @@ discordClient.on("messageCreate", async (message) => {
           waToDiscord.set(sent.id._serialized, message.id);
           discordToWa.set(message.id, sent.id._serialized);
         }
-      } catch (e) {
-        console.error("Erreur media DC->WA :", e.message);
-      }
+      } catch (e) { console.error("Erreur media DC->WA :", e.message); }
     }
 
-  } catch (e) {
-    console.error("Erreur DC->WA :", e.message);
-  }
+  } catch (e) { console.error("Erreur DC->WA :", e.message); }
 });
 
 // ================= DISCORD : EDITION =================
@@ -380,9 +404,7 @@ discordClient.on("messageUpdate", async (_, newMessage) => {
     const messages  = await group.fetchMessages({ limit: 50 });
     const msgToEdit = messages.find((m) => m.id._serialized === waId);
     if (msgToEdit) await msgToEdit.edit(newMessage.content);
-  } catch (e) {
-    console.error("Erreur edition DC->WA :", e.message);
-  }
+  } catch (e) { console.error("Erreur edition DC->WA :", e.message); }
 });
 
 // ================= DISCORD : SUPPRESSION =================
@@ -397,9 +419,7 @@ discordClient.on("messageDelete", async (message) => {
     const messages    = await group.fetchMessages({ limit: 50 });
     const msgToDelete = messages.find((m) => m.id._serialized === waId);
     if (msgToDelete) await msgToDelete.delete(true);
-  } catch (e) {
-    console.error("Erreur suppression DC->WA :", e.message);
-  }
+  } catch (e) { console.error("Erreur suppression DC->WA :", e.message); }
 });
 
 // ================= START =================
