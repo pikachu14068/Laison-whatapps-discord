@@ -9,16 +9,18 @@ const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 
 // ================= CONFIG =================
 
-const DISCORD_TOKEN      = "tok token";
-const DISCORD_CHANNEL_ID = "ton chanelle id";
-const WEBHOOK_URL        = "ton webhook url";
+const DISCORD_TOKEN      = "Ton TOKEN";
+const DISCORD_CHANNEL_ID = "ton id chanelle";
+const WEBHOOK_URL        = "ton webhook URL";
 
 const SERVER_IP   = "ton ip";
-const SERVER_PORT = ton_port-ici;
+const SERVER_PORT = ton_port;
 
-const MEDIA_DIR  = "./media";
-const AVATAR_DIR = "./avatars";
-const LOG_FILE   = "./bridge.log";
+const MEDIA_DIR   = "./media";
+const AVATAR_DIR  = "./avatars";
+const LOG_FILE    = "./bridge.log";
+const MUTES_FILE  = "./mutes.json";
+const GROUP_FILE  = "./selected_group.json";
 
 // ================= CHROMIUM =================
 
@@ -44,15 +46,11 @@ function findChromium() {
 http.createServer((req, res) => {
   const basename = path.basename(req.url);
   if (!basename || basename === "." || basename === "/") {
-    res.writeHead(404);
-    res.end();
-    return;
+    res.writeHead(404); res.end(); return;
   }
   const filepath = path.join(__dirname, "avatars", basename);
   if (!fs.existsSync(filepath) || fs.statSync(filepath).isDirectory()) {
-    res.writeHead(404);
-    res.end();
-    return;
+    res.writeHead(404); res.end(); return;
   }
   res.writeHead(200, { "Content-Type": "image/jpeg" });
   fs.createReadStream(filepath).pipe(res);
@@ -99,6 +97,117 @@ const discordToWa  = new Map();
 const sentByBridge = new Set();
 const avatarCache  = new Map();
 
+// ================= PERSISTENCE GROUPE =================
+
+function loadSelectedGroup() {
+  try {
+    if (fs.existsSync(GROUP_FILE)) {
+      const data = JSON.parse(fs.readFileSync(GROUP_FILE, "utf8"));
+      if (data && data.groupId) {
+        selectedGroupId = data.groupId;
+        console.log("Groupe restaure : " + selectedGroupId);
+      }
+    }
+  } catch (e) {
+    console.error("Erreur chargement groupe :", e.message);
+  }
+}
+
+function saveSelectedGroup() {
+  try {
+    fs.writeFileSync(GROUP_FILE, JSON.stringify({ groupId: selectedGroupId }, null, 2));
+  } catch (e) {
+    console.error("Erreur sauvegarde groupe :", e.message);
+  }
+}
+
+loadSelectedGroup();
+
+// ================= MUTES =================
+
+let mutedUsers = {};
+
+function loadMutes() {
+  try {
+    if (fs.existsSync(MUTES_FILE)) {
+      mutedUsers = JSON.parse(fs.readFileSync(MUTES_FILE, "utf8"));
+      const now = Date.now();
+      for (const id of Object.keys(mutedUsers)) {
+        if (mutedUsers[id] <= now) delete mutedUsers[id];
+      }
+      saveMutes();
+      console.log("Mutes charges :", Object.keys(mutedUsers).length, "actifs");
+    }
+  } catch (e) {
+    console.error("Erreur chargement mutes :", e.message);
+    mutedUsers = {};
+  }
+}
+
+function saveMutes() {
+  try {
+    fs.writeFileSync(MUTES_FILE, JSON.stringify(mutedUsers, null, 2));
+  } catch (e) {
+    console.error("Erreur sauvegarde mutes :", e.message);
+  }
+}
+
+function isMuted(contactId) {
+  const expireAt = mutedUsers[contactId];
+  if (!expireAt) return false;
+  if (Date.now() > expireAt) {
+    delete mutedUsers[contactId];
+    saveMutes();
+    return false;
+  }
+  return true;
+}
+
+function parseDuration(str) {
+  const match = str.match(/^(\d+)(m|h|d)$/i);
+  if (!match) return null;
+  const value = parseInt(match[1], 10);
+  const unit  = match[2].toLowerCase();
+  if (unit === "m") return value * 60 * 1000;
+  if (unit === "h") return value * 60 * 60 * 1000;
+  if (unit === "d") return value * 24 * 60 * 60 * 1000;
+  return null;
+}
+
+function formatExpire(ts) {
+  return new Date(ts).toLocaleString("fr-FR");
+}
+
+async function isGroupAdmin(contact, groupChat) {
+  try {
+    const participant = groupChat.participants.find(
+      (p) => p.id._serialized === contact.id._serialized
+    );
+    return participant && (participant.isAdmin || participant.isSuperAdmin);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function resolveMentionedContact(msg) {
+  try {
+    if (typeof msg.getMentions === "function") {
+      const mentioned = await msg.getMentions();
+      if (mentioned && mentioned.length > 0) return mentioned[0];
+    }
+    if (msg.mentionedIds && msg.mentionedIds.length > 0) {
+      const contact = await waClient.getContactById(msg.mentionedIds[0]);
+      return contact || null;
+    }
+    return null;
+  } catch (e) {
+    console.error("Erreur resolveMention :", e.message);
+    return null;
+  }
+}
+
+loadMutes();
+
 // ================= HELPERS =================
 
 function log(source, user, content) {
@@ -127,20 +236,25 @@ async function getSelectedGroup() {
   return chats.find((c) => c.id._serialized === selectedGroupId) || null;
 }
 
-// Priorit� : nom que TU as donn� au contact > pushname WA > num�ro
 function getContactName(contact) {
   return contact.name || contact.pushname || contact.number || "Inconnu";
 }
 
-// T�l�charge l'avatar via puppeteer et retourne une URL publique
 async function getAvatarUrl(contact) {
+  if (!contact || !contact.id) return null;
   const id = contact.id._serialized;
   if (avatarCache.has(id)) return avatarCache.get(id);
 
+  let picUrl = null;
   try {
-    const picUrl = await contact.getProfilePicUrl();
-    if (!picUrl) { avatarCache.set(id, null); return null; }
+    picUrl = await contact.getProfilePicUrl();
+  } catch (_) {
+    avatarCache.set(id, null);
+    return null;
+  }
+  if (!picUrl) { avatarCache.set(id, null); return null; }
 
+  try {
     const page   = waClient.pupPage;
     const buffer = await page.evaluate(async (url) => {
       try {
@@ -153,12 +267,11 @@ async function getAvatarUrl(contact) {
 
     if (!buffer || buffer.length === 0) { avatarCache.set(id, null); return null; }
 
-    const filename = id.replace(/[^a-zA-Z0-9]/g, "_") + ".jpg";
-    const filepath = AVATAR_DIR + "/" + filename;
+    const filename  = id.replace(/[^a-zA-Z0-9]/g, "_") + ".jpg";
+    const filepath  = AVATAR_DIR + "/" + filename;
     fs.writeFileSync(filepath, Buffer.from(buffer));
 
     const publicUrl = "http://" + SERVER_IP + ":" + SERVER_PORT + "/" + filename;
-    console.log("Avatar OK : " + publicUrl);
     avatarCache.set(id, publicUrl);
     return publicUrl;
 
@@ -231,9 +344,89 @@ waClient.on("message", async (msg) => {
   if (sentByBridge.has(waId)) { sentByBridge.delete(waId); return; }
 
   try {
-    const contact   = await msg.getContact();
-    const name      = getContactName(contact);
-    const text      = msg.body || "";
+    const contact  = await msg.getContact();
+    if (!contact) return;
+    const name     = getContactName(contact);
+    const text     = msg.body || "";
+    const senderId = contact.id._serialized;
+
+    // ================= COMMANDES ADMIN =================
+
+    const group = await getSelectedGroup();
+
+    if (group && text.startsWith("!mute ")) {
+      const adminCheck = await isGroupAdmin(contact, group);
+      if (!adminCheck) {
+        await group.sendMessage("⛔ Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
+        return;
+      }
+      const parts       = text.trim().split(/\s+/);
+      const durationStr = parts[parts.length - 1];
+      const durationMs  = parseDuration(durationStr);
+      if (!durationMs) {
+        await group.sendMessage(
+          "⛔ Format invalide. Exemple : `!mute @Personne 2d`\nUnités : m (minutes), h (heures), d (jours)",
+          { quotedMessageId: waId }
+        );
+        return;
+      }
+      const target = await resolveMentionedContact(msg);
+      if (!target) {
+        await group.sendMessage("⛔ Mentionne un membre avec @.", { quotedMessageId: waId });
+        return;
+      }
+      const targetId   = target.id._serialized;
+      const targetName = getContactName(target);
+      const targetIsAdmin = await isGroupAdmin(target, group);
+      if (targetIsAdmin) {
+        await group.sendMessage("⛔ Impossible de muter un admin du groupe.", { quotedMessageId: waId });
+        return;
+      }
+      const expireAt = Date.now() + durationMs;
+      mutedUsers[targetId] = expireAt;
+      saveMutes();
+      log("MUTE", name, targetName + " mute jusqu'au " + formatExpire(expireAt));
+      await group.sendMessage(
+        "🔇 *" + targetName + "* est mute jusqu'au *" + formatExpire(expireAt) +
+        "*.\nSes messages ne seront pas transmis vers Discord.",
+        { quotedMessageId: waId }
+      );
+      return;
+    }
+
+    if (group && text.startsWith("!unmute ")) {
+      const adminCheck = await isGroupAdmin(contact, group);
+      if (!adminCheck) {
+        await group.sendMessage("⛔ Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
+        return;
+      }
+      const target = await resolveMentionedContact(msg);
+      if (!target) {
+        await group.sendMessage("⛔ Mentionne un membre avec @.", { quotedMessageId: waId });
+        return;
+      }
+      const targetId   = target.id._serialized;
+      const targetName = getContactName(target);
+      if (mutedUsers[targetId]) {
+        delete mutedUsers[targetId];
+        saveMutes();
+        log("UNMUTE", name, targetName + " demute");
+        await group.sendMessage("🔊 *" + targetName + "* n'est plus mute.", { quotedMessageId: waId });
+      } else {
+        await group.sendMessage("🔊 *" + targetName + "* n'est pas mute.", { quotedMessageId: waId });
+      }
+      return;
+    }
+
+    // ================= FILTRAGE MUTE =================
+
+    if (isMuted(senderId)) {
+      log("MUTE_BLOCK", name, "Message bloque (mute actif)");
+      return;
+    }
+
+    // ================= BRIDGE WA -> DC =================
+
     const avatarUrl = await getAvatarUrl(contact);
 
     log("WA->DC", name, text || "[MEDIA]");
@@ -246,7 +439,7 @@ waClient.on("message", async (msg) => {
           const { filename, filepath } = saveMedia(media.data, media.mimetype, msg.type);
           files.push({ attachment: filepath, name: filename });
         }
-      } catch (e) { console.error("Erreur media :", e.message); }
+      } catch (e) { console.error("Erreur media WA->DC :", e.message); }
     }
 
     let replyPrefix = "";
@@ -281,10 +474,11 @@ waClient.on("message_edit", async (msg) => {
   if (!discordId) return;
   try {
     const contact = await msg.getContact();
-    const name    = getContactName(contact);
-    const channel = await getDiscordChannel();
-    const dMsg    = await channel.messages.fetch(discordId);
-    await dMsg.edit(name + " : " + (msg.body || "[MEDIA]") + " *(edite)*");
+    if (!contact) return;
+    const name = getContactName(contact);
+    await webhook.editMessage(discordId, {
+      content: name + " : " + (msg.body || "[MEDIA]") + " *(edité)*",
+    });
   } catch (e) { console.error("Erreur edition WA->DC :", e.message); }
 });
 
@@ -295,10 +489,13 @@ waClient.on("message_revoke_everyone", async (_, revokedMsg) => {
   const discordId = waToDiscord.get(revokedMsg.id._serialized);
   if (!discordId) return;
   try {
-    const channel = await getDiscordChannel();
-    const dMsg    = await channel.messages.fetch(discordId);
-    await dMsg.delete();
-  } catch (e) { console.error("Erreur suppression WA->DC :", e.message); }
+    await webhook.deleteMessage(discordId);
+  } catch (e) {
+    // "Unknown Message" = déjà supprimé ou trop vieux, on ignore silencieusement
+    if (!e.message.includes("Unknown Message")) {
+      console.error("Erreur suppression WA->DC :", e.message);
+    }
+  }
 });
 
 // ================= DISCORD -> WHATSAPP =================
@@ -311,84 +508,107 @@ discordClient.on("messageCreate", async (message) => {
   const name    = message.member ? message.member.displayName : message.author.username;
   const content = message.content;
 
+  // ================= COMMANDES DISCORD =================
+
   if (content === "!groupes") {
-    const chats  = await waClient.getChats();
-    const groups = chats.filter((c) => c.isGroup);
-    if (!groups.length) { await message.reply("Aucun groupe trouve."); return; }
-    let txt = "Groupes disponibles :\n";
-    groups.forEach((g, i) => { txt += (i + 1) + ". " + g.name + "\n"; });
-    await message.reply(txt);
+    try {
+      const chats  = await waClient.getChats();
+      const groups = chats.filter((c) => c.isGroup);
+      if (!groups.length) { await message.reply("Aucun groupe trouve."); return; }
+      let txt = "Groupes disponibles :\n";
+      groups.forEach((g, i) => { txt += (i + 1) + ". " + g.name + "\n"; });
+      await message.reply(txt);
+    } catch (e) { console.error("Erreur !groupes :", e.message); }
     return;
   }
 
   if (content.startsWith("!select ")) {
-    const index  = parseInt(content.split(" ")[1], 10) - 1;
-    const chats  = await waClient.getChats();
-    const groups = chats.filter((c) => c.isGroup);
-    if (isNaN(index) || !groups[index]) {
-      await message.reply("Numero invalide. Utilise !groupes.");
-      return;
-    }
-    selectedGroupId = groups[index].id._serialized;
-    await message.reply("Groupe selectionne : " + groups[index].name);
+    try {
+      const index  = parseInt(content.split(" ")[1], 10) - 1;
+      const chats  = await waClient.getChats();
+      const groups = chats.filter((c) => c.isGroup);
+      if (isNaN(index) || !groups[index]) {
+        await message.reply("Numero invalide. Utilise !groupes.");
+        return;
+      }
+      selectedGroupId = groups[index].id._serialized;
+      saveSelectedGroup();
+      await message.reply("Groupe selectionne : " + groups[index].name);
+    } catch (e) { console.error("Erreur !select :", e.message); }
     return;
   }
 
   if (content === "!status") {
-    const group = await getSelectedGroup();
-    await message.reply(
-      waReady
-        ? "WhatsApp connecte\nGroupe : " + (group ? group.name : "aucun selectionne")
-        : "WhatsApp non connecte"
-    );
+    try {
+      const group = await getSelectedGroup();
+      await message.reply(
+        waReady
+          ? "WhatsApp connecte\nGroupe : " + (group ? group.name : "aucun selectionne")
+          : "WhatsApp non connecte"
+      );
+    } catch (e) { console.error("Erreur !status :", e.message); }
     return;
   }
 
   if (content === "!help") {
     await message.reply(
       "Commandes :\n" +
-      "!groupes � Liste les groupes\n" +
-      "!select <n> � Selectionne un groupe\n" +
-      "!status � Etat connexion\n" +
-      "!help � Cette aide"
+      "!groupes — Liste les groupes\n" +
+      "!select <n> — Selectionne un groupe\n" +
+      "!status — Etat connexion\n" +
+      "!help — Cette aide"
     );
     return;
   }
 
+  // ================= BRIDGE DC -> WA =================
+
   const group = await getSelectedGroup();
-  if (!group) { await message.reply("Aucun groupe selectionne. Utilise !select <n>."); return; }
+  if (!group) {
+    await message.reply("Aucun groupe selectionne. Utilise !select <n>.");
+    return;
+  }
 
-  try {
-    log("DC->WA", name, content || "[MEDIA]");
+  const replyOptions = {};
+  if (message.reference && message.reference.messageId) {
+    const quotedWaId = discordToWa.get(message.reference.messageId);
+    if (quotedWaId) replyOptions.quotedMessageId = quotedWaId;
+  }
 
-    const replyOptions = {};
-    if (message.reference && message.reference.messageId) {
-      const quotedWaId = discordToWa.get(message.reference.messageId);
-      if (quotedWaId) replyOptions.quotedMessageId = quotedWaId;
-    }
-
-    if (content && !content.startsWith("!")) {
+  // Envoi du texte
+  if (content && !content.startsWith("!")) {
+    try {
       const sent = await group.sendMessage("*" + name + "* : " + content, replyOptions);
       if (sent) {
         sentByBridge.add(sent.id._serialized);
         waToDiscord.set(sent.id._serialized, message.id);
         discordToWa.set(message.id, sent.id._serialized);
+        log("DC->WA", name, content);
+      } else {
+        log("DC->WA_FAIL", name, "sendMessage a retourne null | msg: " + content);
       }
+    } catch (e) {
+      log("DC->WA_ERROR", name, "ERREUR: " + e.message + " | msg: " + content);
     }
+  }
 
-    for (const att of message.attachments.values()) {
-      try {
-        const media = await MessageMedia.fromUrl(att.url);
-        const sent  = await group.sendMessage(media, Object.assign({}, replyOptions, { caption: "*" + name + "*" }));
-        if (sent) {
-          sentByBridge.add(sent.id._serialized);
-          waToDiscord.set(sent.id._serialized, message.id);
-          discordToWa.set(message.id, sent.id._serialized);
-        }
-      } catch (e) { console.error("Erreur media DC->WA :", e.message); }
+  // Envoi des pieces jointes
+  for (const att of message.attachments.values()) {
+    try {
+      const media = await MessageMedia.fromUrl(att.url);
+      const sent  = await group.sendMessage(media, Object.assign({}, replyOptions, { caption: "*" + name + "*" }));
+      if (sent) {
+        sentByBridge.add(sent.id._serialized);
+        waToDiscord.set(sent.id._serialized, message.id);
+        discordToWa.set(message.id, sent.id._serialized);
+        log("DC->WA", name, "[MEDIA] " + att.name);
+      } else {
+        log("DC->WA_FAIL", name, "sendMessage media a retourne null | fichier: " + att.name);
+      }
+    } catch (e) {
+      log("DC->WA_ERROR", name, "ERREUR media: " + e.message + " | fichier: " + att.name);
     }
-
-  } catch (e) { console.error("Erreur DC->WA :", e.message); }
+  }
 });
 
 // ================= DISCORD : EDITION =================
@@ -401,8 +621,7 @@ discordClient.on("messageUpdate", async (_, newMessage) => {
   const group = await getSelectedGroup();
   if (!group) return;
   try {
-    const messages  = await group.fetchMessages({ limit: 50 });
-    const msgToEdit = messages.find((m) => m.id._serialized === waId);
+    const msgToEdit = await waClient.getMessageById(waId);
     if (msgToEdit) await msgToEdit.edit(newMessage.content);
   } catch (e) { console.error("Erreur edition DC->WA :", e.message); }
 });
@@ -413,11 +632,8 @@ discordClient.on("messageDelete", async (message) => {
   if (message.channel.id !== DISCORD_CHANNEL_ID) return;
   const waId = discordToWa.get(message.id);
   if (!waId) return;
-  const group = await getSelectedGroup();
-  if (!group) return;
   try {
-    const messages    = await group.fetchMessages({ limit: 50 });
-    const msgToDelete = messages.find((m) => m.id._serialized === waId);
+    const msgToDelete = await waClient.getMessageById(waId);
     if (msgToDelete) await msgToDelete.delete(true);
   } catch (e) { console.error("Erreur suppression DC->WA :", e.message); }
 });
