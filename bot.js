@@ -1,6 +1,4 @@
 const fs = require("fs");
-const http = require("http");
-const path = require("path");
 const qrcode = require("qrcode");
 const fetch = require("node-fetch");
 
@@ -9,15 +7,11 @@ const { Client: WAClient, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 
 // ================= CONFIG =================
 
-const DISCORD_TOKEN      = "Ton TOKEN";
-const DISCORD_CHANNEL_ID = "ton id chanelle";
-const WEBHOOK_URL        = "ton webhook URL";
-
-const SERVER_IP   = "ton ip";
-const SERVER_PORT = ton_port;
+const DISCORD_TOKEN      = "ton token";
+const DISCORD_CHANNEL_ID = "ton chanelle id";
+const WEBHOOK_URL        = "ton webhook url";
 
 const MEDIA_DIR   = "./media";
-const AVATAR_DIR  = "./avatars";
 const LOG_FILE    = "./bridge.log";
 const MUTES_FILE  = "./mutes.json";
 const GROUP_FILE  = "./selected_group.json";
@@ -41,27 +35,9 @@ function findChromium() {
   return undefined;
 }
 
-// ================= SERVEUR HTTP AVATARS =================
-
-http.createServer((req, res) => {
-  const basename = path.basename(req.url);
-  if (!basename || basename === "." || basename === "/") {
-    res.writeHead(404); res.end(); return;
-  }
-  const filepath = path.join(__dirname, "avatars", basename);
-  if (!fs.existsSync(filepath) || fs.statSync(filepath).isDirectory()) {
-    res.writeHead(404); res.end(); return;
-  }
-  res.writeHead(200, { "Content-Type": "image/jpeg" });
-  fs.createReadStream(filepath).pipe(res);
-}).listen(SERVER_PORT, () => {
-  console.log("Serveur avatars port " + SERVER_PORT);
-});
-
 // ================= INIT =================
 
 if (!fs.existsSync(MEDIA_DIR))  fs.mkdirSync(MEDIA_DIR,  { recursive: true });
-if (!fs.existsSync(AVATAR_DIR)) fs.mkdirSync(AVATAR_DIR, { recursive: true });
 
 const webhook = new WebhookClient({ url: WEBHOOK_URL });
 
@@ -95,7 +71,6 @@ let startTimestamp  = Math.floor(Date.now() / 1000);
 const waToDiscord  = new Map();
 const discordToWa  = new Map();
 const sentByBridge = new Set();
-const avatarCache  = new Map();
 
 // ================= PERSISTENCE GROUPE =================
 
@@ -240,47 +215,6 @@ function getContactName(contact) {
   return contact.name || contact.pushname || contact.number || "Inconnu";
 }
 
-async function getAvatarUrl(contact) {
-  if (!contact || !contact.id) return null;
-  const id = contact.id._serialized;
-  if (avatarCache.has(id)) return avatarCache.get(id);
-
-  let picUrl = null;
-  try {
-    picUrl = await contact.getProfilePicUrl();
-  } catch (_) {
-    avatarCache.set(id, null);
-    return null;
-  }
-  if (!picUrl) { avatarCache.set(id, null); return null; }
-
-  try {
-    const page   = waClient.pupPage;
-    const buffer = await page.evaluate(async (url) => {
-      try {
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        const ab  = await res.arrayBuffer();
-        return Array.from(new Uint8Array(ab));
-      } catch (_) { return null; }
-    }, picUrl);
-
-    if (!buffer || buffer.length === 0) { avatarCache.set(id, null); return null; }
-
-    const filename  = id.replace(/[^a-zA-Z0-9]/g, "_") + ".jpg";
-    const filepath  = AVATAR_DIR + "/" + filename;
-    fs.writeFileSync(filepath, Buffer.from(buffer));
-
-    const publicUrl = "http://" + SERVER_IP + ":" + SERVER_PORT + "/" + filename;
-    avatarCache.set(id, publicUrl);
-    return publicUrl;
-
-  } catch (e) {
-    console.error("Erreur avatar :", e.message);
-    avatarCache.set(id, null);
-    return null;
-  }
-}
 
 async function buildReplyPrefix(quotedDiscordId) {
   if (!quotedDiscordId) return "";
@@ -357,7 +291,7 @@ waClient.on("message", async (msg) => {
     if (group && text.startsWith("!mute ")) {
       const adminCheck = await isGroupAdmin(contact, group);
       if (!adminCheck) {
-        await group.sendMessage("⛔ Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
+        await group.sendMessage("? Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
         return;
       }
       const parts       = text.trim().split(/\s+/);
@@ -365,21 +299,21 @@ waClient.on("message", async (msg) => {
       const durationMs  = parseDuration(durationStr);
       if (!durationMs) {
         await group.sendMessage(
-          "⛔ Format invalide. Exemple : `!mute @Personne 2d`\nUnités : m (minutes), h (heures), d (jours)",
+          "? Format invalide. Exemple : `!mute @Personne 2d`\nUnités : m (minutes), h (heures), d (jours)",
           { quotedMessageId: waId }
         );
         return;
       }
       const target = await resolveMentionedContact(msg);
       if (!target) {
-        await group.sendMessage("⛔ Mentionne un membre avec @.", { quotedMessageId: waId });
+        await group.sendMessage("? Mentionne un membre avec @.", { quotedMessageId: waId });
         return;
       }
       const targetId   = target.id._serialized;
       const targetName = getContactName(target);
       const targetIsAdmin = await isGroupAdmin(target, group);
       if (targetIsAdmin) {
-        await group.sendMessage("⛔ Impossible de muter un admin du groupe.", { quotedMessageId: waId });
+        await group.sendMessage("? Impossible de muter un admin du groupe.", { quotedMessageId: waId });
         return;
       }
       const expireAt = Date.now() + durationMs;
@@ -387,8 +321,8 @@ waClient.on("message", async (msg) => {
       saveMutes();
       log("MUTE", name, targetName + " mute jusqu'au " + formatExpire(expireAt));
       await group.sendMessage(
-        "🔇 *" + targetName + "* est mute jusqu'au *" + formatExpire(expireAt) +
-        "*.\nSes messages ne seront pas transmis vers Discord.",
+        "?? *" + targetName + "* est mute jusqu'au *" + formatExpire(expireAt) +
+        "*.\nSes messages seront automatiquement supprimés du groupe.",
         { quotedMessageId: waId }
       );
       return;
@@ -397,12 +331,12 @@ waClient.on("message", async (msg) => {
     if (group && text.startsWith("!unmute ")) {
       const adminCheck = await isGroupAdmin(contact, group);
       if (!adminCheck) {
-        await group.sendMessage("⛔ Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
+        await group.sendMessage("? Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
         return;
       }
       const target = await resolveMentionedContact(msg);
       if (!target) {
-        await group.sendMessage("⛔ Mentionne un membre avec @.", { quotedMessageId: waId });
+        await group.sendMessage("? Mentionne un membre avec @.", { quotedMessageId: waId });
         return;
       }
       const targetId   = target.id._serialized;
@@ -411,33 +345,45 @@ waClient.on("message", async (msg) => {
         delete mutedUsers[targetId];
         saveMutes();
         log("UNMUTE", name, targetName + " demute");
-        await group.sendMessage("🔊 *" + targetName + "* n'est plus mute.", { quotedMessageId: waId });
+        await group.sendMessage("?? *" + targetName + "* n'est plus mute.", { quotedMessageId: waId });
       } else {
-        await group.sendMessage("🔊 *" + targetName + "* n'est pas mute.", { quotedMessageId: waId });
+        await group.sendMessage("?? *" + targetName + "* n'est pas mute.", { quotedMessageId: waId });
       }
       return;
     }
 
-    // ================= FILTRAGE MUTE =================
+    // ================= FILTRAGE MUTE : SUPPRESSION DU MESSAGE =================
+    // Si l'expéditeur est mute, on supprime son message directement sur WhatsApp
+    // et on ne transmet rien vers Discord.
 
     if (isMuted(senderId)) {
-      log("MUTE_BLOCK", name, "Message bloque (mute actif)");
+      log("MUTE_BLOCK", name, "Message supprime (mute actif)");
+      try {
+        await msg.delete(true); // true = supprimer pour tout le monde
+      } catch (e) {
+        console.error("Erreur suppression message mute :", e.message);
+      }
       return;
     }
 
     // ================= BRIDGE WA -> DC =================
 
-    const avatarUrl = await getAvatarUrl(contact);
-
     log("WA->DC", name, text || "[MEDIA]");
+
+    const MAX_DISCORD_FILE_SIZE = 8 * 1024 * 1024; // 8 MB limite Discord webhook
 
     const files = [];
     if (msg.hasMedia) {
       try {
         const media = await msg.downloadMedia();
         if (media) {
-          const { filename, filepath } = saveMedia(media.data, media.mimetype, msg.type);
-          files.push({ attachment: filepath, name: filename });
+          const sizeBytes = Math.ceil(media.data.length * 0.75);
+          if (sizeBytes > MAX_DISCORD_FILE_SIZE) {
+            log("MEDIA_SKIP", name, "Fichier trop lourd (" + Math.round(sizeBytes / 1024 / 1024) + " MB), non envoye sur Discord");
+          } else {
+            const { filename, filepath } = saveMedia(media.data, media.mimetype, msg.type);
+            files.push({ attachment: filepath, name: filename });
+          }
         }
       } catch (e) { console.error("Erreur media WA->DC :", e.message); }
     }
@@ -456,7 +402,6 @@ waClient.on("message", async (msg) => {
 
     const sent = await webhook.send({
       username:  name,
-      avatarURL: avatarUrl || undefined,
       content:   finalContent || " ",
       files,
     });
@@ -479,7 +424,11 @@ waClient.on("message_edit", async (msg) => {
     await webhook.editMessage(discordId, {
       content: name + " : " + (msg.body || "[MEDIA]") + " *(edité)*",
     });
-  } catch (e) { console.error("Erreur edition WA->DC :", e.message); }
+  } catch (e) {
+    if (!e.message.includes("Unknown Message")) {
+      console.error("Erreur edition WA->DC :", e.message);
+    }
+  }
 });
 
 // ================= WHATSAPP : SUPPRESSION =================
@@ -491,7 +440,6 @@ waClient.on("message_revoke_everyone", async (_, revokedMsg) => {
   try {
     await webhook.deleteMessage(discordId);
   } catch (e) {
-    // "Unknown Message" = déjà supprimé ou trop vieux, on ignore silencieusement
     if (!e.message.includes("Unknown Message")) {
       console.error("Erreur suppression WA->DC :", e.message);
     }
@@ -575,7 +523,6 @@ discordClient.on("messageCreate", async (message) => {
     if (quotedWaId) replyOptions.quotedMessageId = quotedWaId;
   }
 
-  // Envoi du texte
   if (content && !content.startsWith("!")) {
     try {
       const sent = await group.sendMessage("*" + name + "* : " + content, replyOptions);
@@ -592,7 +539,6 @@ discordClient.on("messageCreate", async (message) => {
     }
   }
 
-  // Envoi des pieces jointes
   for (const att of message.attachments.values()) {
     try {
       const media = await MessageMedia.fromUrl(att.url);
