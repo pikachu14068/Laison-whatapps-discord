@@ -1,24 +1,19 @@
 {
-  "name": "whatapps-discord",
-  "version": "2.4.10",
+  "name": "bridge-discord-whatsapp",
+  "version": "3.0.0",
+  "description": "Pont Discord <-> WhatsApp",
   "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "module",
   "dependencies": {
-    "@adiwajshing/baileys": "^5.0.0",
-    "discord.js": "^14.25.1",
-    "dotenv": "^17.3.1",
-    "node-fetch": "^3.3.2",
-    "puppeteer": "^24.37.5",
-    "puppeteer-core": "^24.37.4",
-    "qrcode": "^1.5.4",
-    "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.6"
-  },
-  "description": "le bot permétant de relier tout vos méilleur pote meme si il on pas discord"
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.7.0",
+    "pino": "^9.4.0",
+    "qrcode": "^1.5.4"
+  }
 }
