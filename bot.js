@@ -23,8 +23,11 @@ const {
   downloadMediaMessage,
   getContentType,
   DisconnectReason,
+  makeCacheableSignalKeyStore,
+  Browsers,
   proto,
 } = require("@whiskeysockets/baileys");
+const NodeCache = require("node-cache");
 
 // ==========================================================================
 // CONFIG
@@ -93,8 +96,8 @@ const waToDiscord      = new Map();
 const discordToWa      = new Map();
 const sentByBridge      = new Set();
 const avatarCache       = new Map();
-const contactNamesCache = new Map();  
-const waMessageStore    = new Map(); 
+const contactNamesCache = new Map(); 
+const waMessageStore    = new Map();  
 
 // ==========================================================================
 // LOGGING
@@ -293,6 +296,9 @@ async function getCachedGuildMembers() {
   return guild;
 }
 
+// Recherche un membre humain (jamais un bot, jamais le bridge lui-même) par pseudo/surnom.
+// Priorise toujours un match EXACT avant un match "flou", pour éviter de pinguer la
+// mauvaise personne (ou le bot du pont) à cause d'une simple sous-chaîne en commun.
 function findGuildMemberByName(guild, name) {
   if (!guild || !name) return null;
   const nameLower = String(name).toLowerCase().trim();
@@ -320,7 +326,7 @@ function findGuildMemberByName(guild, name) {
 // CACHE : GROUPE WHATSAPP SELECTIONNE (Baileys : groupMetadata)
 // ==========================================================================
 
-const groupMetadataCache = new Map();
+const groupMetadataCache = new Map(); // jid -> { metadata, at }
 
 function invalidateGroupCache() {
   groupMetadataCache.clear();
@@ -335,6 +341,15 @@ async function fetchGroupMetadataCached(jid) {
   return metadata;
 }
 
+function isTransientSessionError(e) {
+  const msg = (e && e.message) || String(e);
+  return (
+    msg.includes("No sessions") ||
+    msg.includes("SessionError") ||
+    (e && e.name === "SessionError")
+  );
+}
+
 async function sendWaMessage(jid, content, options = {}) {
   const payload = typeof content === "string" ? { text: content } : { ...content };
   if (options.mentions && options.mentions.length) payload.mentions = options.mentions;
@@ -345,9 +360,25 @@ async function sendWaMessage(jid, content, options = {}) {
     if (quotedMsg) sendOptions.quoted = quotedMsg;
   }
 
-  const sent = await sock.sendMessage(jid, payload, sendOptions);
-  if (sent) rememberWaMessage(sent);
-  return sent;
+  try {
+    const sent = await sock.sendMessage(jid, payload, sendOptions);
+    if (sent) rememberWaMessage(sent);
+    return sent;
+  } catch (e) {
+    if (!isTransientSessionError(e)) throw e;
+    for (const delayMs of [15000, 20000]) {
+      console.warn(`Session pas encore prête pour ${jid}, nouvelle tentative dans ${delayMs / 1000}s...`);
+      await new Promise((r) => setTimeout(r, delayMs));
+      try {
+        const sent = await sock.sendMessage(jid, payload, sendOptions);
+        if (sent) rememberWaMessage(sent);
+        return sent;
+      } catch (e2) {
+        if (!isTransientSessionError(e2)) throw e2;
+      }
+    }
+    throw e;
+  }
 }
 
 async function getSelectedGroup() {
@@ -732,6 +763,7 @@ async function handleTxtCommandWa(msg) {
       return;
     }
 
+    // On reconstruit un WAMessage minimal pour pouvoir télécharger le média cité.
     const quotedFakeMsg = {
       key: {
         remoteJid: msg.key.remoteJid,
@@ -1080,11 +1112,15 @@ async function startWaSocket() {
 
   sock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, waLogger),
+    },
     logger: waLogger,
-    browser: ["Bridge Discord-WA", "Chrome", "1.0.0"],
+    browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    msgRetryCounterCache: new NodeCache(),
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -1134,22 +1170,34 @@ async function startWaSocket() {
       const statusCode = lastDisconnect && lastDisconnect.error instanceof Boom
         ? lastDisconnect.error.output.statusCode
         : null;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-      console.warn("WhatsApp déconnecté, code :", statusCode);
+      const needsFreshSession =
+        statusCode === DisconnectReason.loggedOut ||
+        statusCode === DisconnectReason.badSession;
+
+      const errMsg = lastDisconnect && lastDisconnect.error ? lastDisconnect.error.message : "raison inconnue";
+      console.warn(`WhatsApp déconnecté, code : ${statusCode} — ${errMsg}`);
 
       try {
         const channel = await getDiscordChannel();
         await channel.send(
-          loggedOut
-            ? "⚠️ Session WhatsApp déconnectée (logout depuis le téléphone). Utilise `/qr` ou `/connexion` pour reconnecter."
+          needsFreshSession
+            ? `⚠️ Session WhatsApp invalidée (code ${statusCode}). Nettoyage et reconnexion... Utilise \`/qr\` ou \`/connexion\` si besoin de rescanner.`
             : "⚠️ Le pont WhatsApp a rencontré un problème et se reconnecte automatiquement..."
         );
       } catch (_) {}
 
-      if (loggedOut) {
+      if (needsFreshSession) {
         try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
         waRestartInProgress = false;
+        if (statusCode === DisconnectReason.badSession) {
+          setTimeout(() => {
+            startWaSocket().catch((e) => {
+              logError("Erreur reconnexion WA après badSession", e);
+              waRestartInProgress = false;
+            });
+          }, 5000);
+        }
       } else {
         setTimeout(() => {
           startWaSocket().catch((e) => {
@@ -1190,7 +1238,6 @@ async function handleIncomingWaMessage(msg) {
   const ts = Number(msg.messageTimestamp || 0);
   if (ts < startTimestamp) return;
 
-  // Editions / suppressions (protocolMessage)
   const contentType = getMessageContentType(msg);
   if (contentType === "protocolMessage") {
     await handleWaProtocolMessage(msg);
@@ -1205,8 +1252,6 @@ async function handleIncomingWaMessage(msg) {
     return;
   }
 
-  // Messages envoyés depuis le téléphone lié lui-même (fromMe) :
-  // uniquement !txt est traité, comme dans la version whatsapp-web.js.
   if (msg.key.fromMe) {
     const rawText = extractText(msg).trim();
     if (rawText === "!txt") {
@@ -1593,7 +1638,7 @@ async function relayDiscordPollToWa(message, group, name) {
     const answers = Array.from(poll.answers.values())
       .map((a) => (a.text || "Option").trim())
       .filter(Boolean)
-      .slice(0, 12); // limite WhatsApp
+      .slice(0, 12);
 
     if (answers.length < 2) {
       log("DC->WA_ERROR", name, "Sondage ignoré (moins de 2 options valides)");
