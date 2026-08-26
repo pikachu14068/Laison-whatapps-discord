@@ -47,7 +47,7 @@ const REQUIRED_ENV_VARS = {
 
 for (const [key, value] of Object.entries(REQUIRED_ENV_VARS)) {
   if (!value) {
-    console.error(`Variable d'environnement manquante : ${key}. Vérifie ton fichier .env.`);
+    console.error(`Variable d'environnement manquante : ${key}. Verifie ton fichier .env.`);
     process.exit(1);
   }
 }
@@ -96,7 +96,8 @@ const waToDiscord      = new Map();
 const discordToWa      = new Map();
 const sentByBridge      = new Set();
 const avatarCache       = new Map();
-const contactNamesCache = new Map(); 
+const contactSavedNameCache  = new Map(); // nom que Pkai a donne au contact dans son repertoire (priorite max)
+const contactNotifyNameCache = new Map(); // pseudo que la personne s'est donne elle-meme sur WhatsApp (fallback)
 const waMessageStore    = new Map();  
 
 // ==========================================================================
@@ -130,58 +131,133 @@ function isFatalWaError(message) {
   );
 }
 
-let waRestartInProgress = false;
+// --------------------------------------------------------------------------
+// IMPORTANT : il n'existe qu'UN SEUL chemin qui relance startWaSocket() :
+// le handler "connection.update" (connection === "close") dans startWaSocket().
+// Avant, restartWaClient() ET ce handler pouvaient chacun programmer un
+// startWaSocket(), ce qui creait DEUX sockets Baileys en parallele sur la
+// meme session -> WhatsApp tue l'un des deux (connectionReplaced) -> boucle
+// de deconnexion infinie. Toute autre fonction ne fait que DEMANDER la
+// fermeture du socket actuel (sock.end()) ; c'est l'event "close" qui
+// declenche ensuite scheduleReconnect().
+// --------------------------------------------------------------------------
 
-async function restartWaClient(reason) {
-  if (waRestartInProgress) return;
+let waRestartInProgress   = false; // true tant qu'un cycle reconnexion est en cours
+let reconnectAttempts     = 0;     // pour le backoff exponentiel
+let reconnectTimer        = null;  // handle du setTimeout actif, pour pouvoir l'annuler
+let discordNotifiedThisCycle = false; // evite de spammer le salon a chaque tentative
+
+const RECONNECT_BASE_DELAY_MS = 3000;
+const RECONNECT_MAX_DELAY_MS  = 60000;
+
+function clearPendingReconnect() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function computeBackoffDelay() {
+  const raw    = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts);
+  const capped = Math.min(raw, RECONNECT_MAX_DELAY_MS);
+  const jitter = Math.random() * 1000;
+  return capped + jitter;
+}
+
+async function notifyDiscordOnce(text) {
+  if (discordNotifiedThisCycle) return;
+  discordNotifiedThisCycle = true;
+  try {
+    const channel = await getDiscordChannel();
+    await channel.send(text);
+  } catch (_) {}
+}
+
+// Point d'entree UNIQUE pour reprogrammer une reconnexion. Appele uniquement
+// depuis le handler "close" de connection.update.
+function scheduleReconnect(reason, { immediate = false, clearSession = false } = {}) {
+  clearPendingReconnect();
   waRestartInProgress = true;
   waReady = false;
   invalidateGroupCache();
-  console.error(`Redémarrage du client WhatsApp suite à : ${reason}`);
 
-  try {
-    const channel = await getDiscordChannel();
-    await channel.send("⚠️ Le pont WhatsApp a rencontré un problème et se reconnecte automatiquement...");
-  } catch (_) {}
-
-  try {
-    if (sock) sock.end(new Error(reason));
-  } catch (e) {
-    logError("Erreur end() pendant le redémarrage", e);
+  if (clearSession) {
+    try {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    } catch (e) {
+      logError("Erreur suppression session pendant reconnexion", e);
+    }
+    reconnectAttempts = 0;
   }
 
-  setTimeout(() => {
+  const delay = immediate ? 500 : computeBackoffDelay();
+  reconnectAttempts += 1;
+
+  console.warn(
+    `Reconnexion WhatsApp programmee dans ${Math.round(delay / 1000)}s (tentative #${reconnectAttempts}) - raison : ${reason}`
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     startWaSocket().catch((e) => {
-      logError("Erreur réinitialisation du client WA", e);
+      logError("Erreur reinitialisation du client WA", e);
       waRestartInProgress = false;
+      // Un echec au demarrage ne declenche PAS connection.update("close"),
+      // donc on doit reprogrammer nous-memes ici pour ne pas rester bloque.
+      scheduleReconnect(`echec startWaSocket: ${e.message}`);
     });
-  }, 5000);
+  }, delay);
+}
+
+// Demande la fin du socket actuel. Ne relance JAMAIS startWaSocket()
+// directement : ca reste le role du handler "close".
+function requestWaSocketEnd(reason) {
+  if (waRestartInProgress) {
+    console.log(`Fin de socket ignoree (reconnexion deja en cours) : ${reason}`);
+    return;
+  }
+  console.error(`Fin du socket WhatsApp demandee : ${reason}`);
+  try {
+    if (sock) {
+      sock.end(new Error(reason));
+    } else {
+      // Aucun socket actif (ex: erreur pendant l'init) : on programme nous-memes.
+      scheduleReconnect(reason);
+    }
+  } catch (e) {
+    logError("Erreur end() pendant la demande de reconnexion", e);
+    scheduleReconnect(reason);
+  }
 }
 
 async function forceQrResend() {
   if (waRestartInProgress) {
-    console.log("Régénération QR ignorée : un redémarrage est déjà en cours.");
+    console.log("Regeneration QR ignoree : un redemarrage est deja en cours.");
     return;
   }
+  clearPendingReconnect();
   waRestartInProgress = true;
   waReady = false;
+  reconnectAttempts = 0;
+  discordNotifiedThisCycle = true; // on ne veut pas du message "probleme detecte" ici
   invalidateGroupCache();
-  console.log("Régénération manuelle du QR code demandée (/qr ou !qr).");
+  console.log("Regeneration manuelle du QR code demandee (/qr ou !qr).");
 
   try {
     if (sock) await sock.logout().catch(() => {});
   } catch (e) {
-    logError("Erreur logout() pendant la régénération QR", e);
+    logError("Erreur logout() pendant la regeneration QR", e);
   }
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
   } catch (e) {
-    logError("Erreur suppression session pendant la régénération QR", e);
+    logError("Erreur suppression session pendant la regeneration QR", e);
   }
 
-  setTimeout(() => {
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
     startWaSocket().catch((e) => {
-      logError("Erreur réinitialisation WA (/qr)", e);
+      logError("Erreur reinitialisation WA (/qr)", e);
       waRestartInProgress = false;
     });
   }, 1000);
@@ -189,13 +265,20 @@ async function forceQrResend() {
 
 process.on("unhandledRejection", (reason) => {
   const msg = (reason && reason.message) || String(reason);
-  logError("Rejet de promesse non géré", reason);
-  if (isFatalWaError(msg)) restartWaClient(`unhandledRejection: ${msg}`);
+  logError("Rejet de promesse non gere", reason);
+  if (isFatalWaError(msg) && sock) requestWaSocketEnd(`unhandledRejection: ${msg}`);
 });
 
 process.on("uncaughtException", (err) => {
-  logError("Exception non interceptée", err);
-  if (isFatalWaError(err.message)) restartWaClient(`uncaughtException: ${err.message}`);
+  logError("Exception non interceptee", err);
+  if (isFatalWaError(err.message) && sock) requestWaSocketEnd(`uncaughtException: ${err.message}`);
+});
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM recu, fermeture propre du socket WhatsApp...");
+  clearPendingReconnect();
+  try { if (sock) sock.end(undefined); } catch (_) {}
+  setTimeout(() => process.exit(0), 500);
 });
 
 // ==========================================================================
@@ -210,7 +293,7 @@ function loadSelectedGroup() {
     const data = JSON.parse(raw);
     if (data && data.groupId) {
       selectedGroupId = data.groupId;
-      console.log(`Groupe restauré : ${selectedGroupId}`);
+      console.log(`Groupe restaure : ${selectedGroupId}`);
     }
   } catch (e) {
     logError("Erreur chargement groupe", e);
@@ -236,7 +319,7 @@ function loadLinks() {
     if (!fs.existsSync(LINKS_FILE)) return;
     const raw = fs.readFileSync(LINKS_FILE, "utf8").trim();
     accountLinks = raw ? JSON.parse(raw) : {};
-    console.log("Liens chargés :", Object.keys(accountLinks).length);
+    console.log("Liens charges :", Object.keys(accountLinks).length);
   } catch (e) {
     logError("Erreur chargement liens", e);
     accountLinks = {};
@@ -296,9 +379,9 @@ async function getCachedGuildMembers() {
   return guild;
 }
 
-// Recherche un membre humain (jamais un bot, jamais le bridge lui-même) par pseudo/surnom.
-// Priorise toujours un match EXACT avant un match "flou", pour éviter de pinguer la
-// mauvaise personne (ou le bot du pont) à cause d'une simple sous-chaîne en commun.
+// Recherche un membre humain (jamais un bot, jamais le bridge lui-meme) par pseudo/surnom.
+// Priorise toujours un match EXACT avant un match "flou", pour eviter de pinguer la
+// mauvaise personne (ou le bot du pont) a cause d'une simple sous-chaine en commun.
 function findGuildMemberByName(guild, name) {
   if (!guild || !name) return null;
   const nameLower = String(name).toLowerCase().trim();
@@ -367,7 +450,7 @@ async function sendWaMessage(jid, content, options = {}) {
   } catch (e) {
     if (!isTransientSessionError(e)) throw e;
     for (const delayMs of [15000, 20000]) {
-      console.warn(`Session pas encore prête pour ${jid}, nouvelle tentative dans ${delayMs / 1000}s...`);
+      console.warn(`Session pas encore prete pour ${jid}, nouvelle tentative dans ${delayMs / 1000}s...`);
       await new Promise((r) => setTimeout(r, delayMs));
       try {
         const sent = await sock.sendMessage(jid, payload, sendOptions);
@@ -392,7 +475,7 @@ async function getSelectedGroup() {
       sendMessage: (content, options) => sendWaMessage(selectedGroupId, content, options),
     };
   } catch (e) {
-    logError("getSelectedGroup a échoué", e);
+    logError("getSelectedGroup a echoue", e);
     return null;
   }
 }
@@ -421,7 +504,7 @@ function loadMutes() {
       if (mutedUsers[id] <= now) delete mutedUsers[id];
     }
     saveMutes();
-    console.log("Mutes chargés :", Object.keys(mutedUsers).length, "actifs");
+    console.log("Mutes charges :", Object.keys(mutedUsers).length, "actifs");
   } catch (e) {
     logError("Erreur chargement mutes", e);
     mutedUsers = {};
@@ -517,6 +600,7 @@ function getQuotedInfo(msg) {
 }
 
 const POLL_CREATION_TYPES = ["pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"];
+const DISCORD_POLL_MAX_ANSWERS = 10; // limite imposee par l'API Discord
 
 function getWaMessageKind(msg) {
   const type = getMessageContentType(msg);
@@ -529,17 +613,25 @@ function getWaMessageKind(msg) {
   return "text";
 }
 
-function formatWaPoll(msg) {
+function extractWaPollData(msg) {
   const type = getMessageContentType(msg);
   if (!POLL_CREATION_TYPES.includes(type)) return null;
   const poll = msg.message[type];
   if (!poll) return null;
 
   const question = poll.name || "Sondage";
-  const options  = (poll.options || []).map((o, i) => `${i + 1}. ${o.optionName}`).join("\n");
+  const options  = (poll.options || []).map((o) => o.optionName).filter(Boolean);
   const multi    = !poll.selectableOptionsCount || poll.selectableOptionsCount > 1;
 
-  return `📊 *Sondage${multi ? " (choix multiples)" : ""} :* ${question}\n${options}`;
+  if (!options.length) return null;
+  return { question, options, multi };
+}
+
+function formatWaPoll(msg) {
+  const data = extractWaPollData(msg);
+  if (!data) return null;
+  const options = data.options.map((o, i) => `${i + 1}. ${o}`).join("\n");
+  return `*Sondage${data.multi ? " (choix multiples)" : ""} :* ${data.question}\n${options}`;
 }
 
 function extensionForKind(kind, msg) {
@@ -567,10 +659,27 @@ function getSenderJid(msg) {
   return msg.key.participant || msg.key.remoteJid;
 }
 
+function getContactDisplayName(jid) {
+  if (!jid) return "Inconnu";
+  return (
+    contactSavedNameCache.get(jid) ||
+    contactNotifyNameCache.get(jid) ||
+    jid.split("@")[0]
+  );
+}
+
 function getSenderName(msg) {
   const jid = getSenderJid(msg);
   const number = jid ? jid.split("@")[0] : "Inconnu";
-  return contactNamesCache.get(jid) || msg.pushName || number;
+  // Priorite absolue au nom que Pkai a donne au contact dans son repertoire.
+  // Sinon, on retombe sur le pseudo WhatsApp de la personne (pushName du
+  // message en priorite car toujours a jour, sinon celui mis en cache).
+  return (
+    contactSavedNameCache.get(jid) ||
+    msg.pushName ||
+    contactNotifyNameCache.get(jid) ||
+    number
+  );
 }
 
 async function downloadWaMedia(msg) {
@@ -598,10 +707,10 @@ async function getDiscordChannel() {
 function friendlyWaErrorReply(e) {
   logError("Erreur WA (commande)", e);
   if (isFatalWaError(e.message)) {
-    restartWaClient(`commande utilisateur: ${e.message}`);
-    return "⚠️ WhatsApp semble déconnecté. Reconnexion automatique en cours, réessaie dans 10-15 secondes.";
+    requestWaSocketEnd(`commande utilisateur: ${e.message}`);
+    return "WhatsApp semble deconnecte. Reconnexion automatique en cours, reessaie dans 10-15 secondes.";
   }
-  return `❌ Erreur : ${e.message}`;
+  return `Erreur : ${e.message}`;
 }
 
 async function buildReplyPrefix(quotedDiscordId) {
@@ -609,7 +718,7 @@ async function buildReplyPrefix(quotedDiscordId) {
   try {
     const channel  = await getDiscordChannel();
     const original = await channel.messages.fetch(quotedDiscordId);
-    const author   = original.author.username;
+    const author   = original.member ? original.member.displayName : original.author.username;
     const preview  = (original.content || "[MEDIA]").split("\n")[0].slice(0, 80);
     return `> **${author}** : ${preview}\n`;
   } catch (_) {
@@ -653,7 +762,7 @@ async function convertWaMentionsToDiscord(text, mentionedJids) {
       continue;
     }
 
-    const name  = contactNamesCache.get(jid) || number;
+    const name  = getContactDisplayName(jid);
     const guild = await getCachedGuildMembers();
 
     const found = guild ? findGuildMemberByName(guild, name) : null;
@@ -753,17 +862,17 @@ async function handleTxtCommandWa(msg) {
   try {
     const ctx = getContextInfo(msg);
     if (!ctx || !ctx.quotedMessage) {
-      await sendWaReply(msg, "❌ Réponds à un message vocal avec !txt.");
+      await sendWaReply(msg, "Reponds a un message vocal avec !txt.");
       return;
     }
 
     const quotedType = getContentType(ctx.quotedMessage);
     if (quotedType !== "audioMessage") {
-      await sendWaReply(msg, "❌ Le message cité n'est pas un message vocal.");
+      await sendWaReply(msg, "Le message cite n'est pas un message vocal.");
       return;
     }
 
-    // On reconstruit un WAMessage minimal pour pouvoir télécharger le média cité.
+    // On reconstruit un WAMessage minimal pour pouvoir telecharger le media cite.
     const quotedFakeMsg = {
       key: {
         remoteJid: msg.key.remoteJid,
@@ -779,34 +888,34 @@ async function handleTxtCommandWa(msg) {
       buffer = await downloadWaMedia(quotedFakeMsg);
     } catch (e) {
       logError("Erreur getQuotedMessage (!txt WA)", e);
-      await sendWaReply(msg, "❌ Impossible de récupérer le message vocal cité (lien expiré). Réessaie avec un vocal plus récent.");
+      await sendWaReply(msg, "Impossible de recuperer le message vocal cite (lien expire). Reessaie avec un vocal plus recent.");
       return;
     }
 
     if (!buffer) {
-      await sendWaReply(msg, "❌ Impossible de télécharger l'audio (média expiré ou indisponible).");
+      await sendWaReply(msg, "Impossible de telecharger l'audio (media expire ou indisponible).");
       return;
     }
 
     const { filepath } = saveMediaBuffer(buffer, "ogg");
-    await sendWaReply(msg, "⏳ Transcription en cours...");
+    await sendWaReply(msg, "Transcription en cours...");
     const transcript = await transcribeVoiceNote(filepath);
 
     await sendWaReply(
       msg,
       transcript
-        ? `🎙️ *Transcription :*\n${transcript}`
-        : "❌ Impossible de transcrire ce message vocal (voir logs serveur pour le détail Groq)."
+        ? `*Transcription :*\n${transcript}`
+        : "Impossible de transcrire ce message vocal (voir logs serveur pour le detail Groq)."
     );
   } catch (e) {
     logError("Erreur !txt WA", e);
-    await sendWaReply(msg, `❌ Erreur : ${e.message}`);
+    await sendWaReply(msg, `Erreur : ${e.message}`);
   }
 }
 
 async function handleTxtCommandDiscord(msg) {
   if (!msg.reference || !msg.reference.messageId) {
-    await msg.reply("❌ Réponds à un message vocal (fichier audio) avec `!txt`.");
+    await msg.reply("Reponds a un message vocal (fichier audio) avec `!txt`.");
     return;
   }
 
@@ -818,11 +927,11 @@ async function handleTxtCommandDiscord(msg) {
     );
 
     if (!audioAtt) {
-      await msg.reply("❌ Aucun fichier audio trouvé dans ce message.");
+      await msg.reply("Aucun fichier audio trouve dans ce message.");
       return;
     }
 
-    await msg.reply("⏳ Transcription en cours...");
+    await msg.reply("Transcription en cours...");
     const res      = await fetch(audioAtt.url);
     const buffer   = await res.buffer();
     const filepath = `${MEDIA_DIR}/${Date.now()}_${audioAtt.name}`;
@@ -831,12 +940,12 @@ async function handleTxtCommandDiscord(msg) {
     const transcript = await transcribeVoiceNote(filepath);
     await msg.reply(
       transcript
-        ? `🎙️ **Transcription :**\n> ${transcript}`
-        : "❌ Impossible de transcrire ce message vocal."
+        ? `**Transcription :**\n> ${transcript}`
+        : "Impossible de transcrire ce message vocal."
     );
   } catch (e) {
     logError("Erreur !txt Discord", e);
-    await msg.reply(`❌ Erreur : ${e.message}`);
+    await msg.reply(`Erreur : ${e.message}`);
   }
 }
 
@@ -850,24 +959,24 @@ async function handleTxtCommand(msg, source) {
 // ==========================================================================
 
 const commands = [
-  new SlashCommandBuilder().setName("ping").setDescription("Vérifie la latence du bot"),
-  new SlashCommandBuilder().setName("status").setDescription("Etat de la connexion WhatsApp et du groupe sélectionné"),
+  new SlashCommandBuilder().setName("ping").setDescription("Verifie la latence du bot"),
+  new SlashCommandBuilder().setName("status").setDescription("Etat de la connexion WhatsApp et du groupe selectionne"),
   new SlashCommandBuilder().setName("groupes").setDescription("Liste les groupes WhatsApp disponibles"),
   new SlashCommandBuilder()
     .setName("select")
-    .setDescription("Sélectionne un groupe WhatsApp")
-    .addIntegerOption((opt) => opt.setName("numero").setDescription("Numéro du groupe (voir /groupes)").setRequired(true)),
+    .setDescription("Selectionne un groupe WhatsApp")
+    .addIntegerOption((opt) => opt.setName("numero").setDescription("Numero du groupe (voir /groupes)").setRequired(true)),
   new SlashCommandBuilder().setName("help").setDescription("Affiche la liste des commandes disponibles"),
-  new SlashCommandBuilder().setName("qr").setDescription("Force l'envoi (ou la régénération) du QR code de connexion WhatsApp"),
+  new SlashCommandBuilder().setName("qr").setDescription("Force l'envoi (ou la regeneration) du QR code de connexion WhatsApp"),
   new SlashCommandBuilder()
     .setName("connexion")
-    .setDescription("Connecte WhatsApp sans QR code : reçois un code de couplage à entrer sur ton téléphone")
-    .addStringOption((opt) => opt.setName("numero").setDescription("Numéro WhatsApp avec indicatif pays, ex: 33612345678").setRequired(true)),
+    .setDescription("Connecte WhatsApp sans QR code : recois un code de couplage a entrer sur ton telephone")
+    .addStringOption((opt) => opt.setName("numero").setDescription("Numero WhatsApp avec indicatif pays, ex: 33612345678").setRequired(true)),
   new SlashCommandBuilder()
     .setName("link")
-    .setDescription("Lie ton pseudo Discord et ton numéro WhatsApp (sert à la sync des mentions @)")
+    .setDescription("Lie ton pseudo Discord et ton numero WhatsApp (sert a la sync des mentions @)")
     .addStringOption((opt) => opt.setName("pseudo").setDescription("Ton nom d'utilisateur Discord").setRequired(true))
-    .addStringOption((opt) => opt.setName("numero").setDescription("Ton numéro WhatsApp (ex: 33612345678)").setRequired(true)),
+    .addStringOption((opt) => opt.setName("numero").setDescription("Ton numero WhatsApp (ex: 33612345678)").setRequired(true)),
 ].map((cmd) => cmd.toJSON());
 
 async function registerSlashCommands() {
@@ -875,7 +984,7 @@ async function registerSlashCommands() {
   try {
     console.log("Enregistrement des slash commands...");
     await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
-    console.log("Slash commands enregistrées.");
+    console.log("Slash commands enregistrees.");
   } catch (e) {
     logError("Erreur enregistrement slash commands", e);
   }
@@ -886,7 +995,7 @@ async function registerSlashCommands() {
 // ==========================================================================
 
 discordClient.once("clientReady", async () => {
-  console.log(`Discord connecté : ${discordClient.user.tag}`);
+  console.log(`Discord connecte : ${discordClient.user.tag}`);
   await registerSlashCommands();
 });
 
@@ -896,28 +1005,28 @@ discordClient.once("clientReady", async () => {
 
 const HELP_TEXT_SLASH =
   "**Commandes slash :**\n" +
-  "`/ping` — Latence du bot\n" +
-  "`/groupes` — Liste les groupes WA\n" +
-  "`/select <n>` — Sélectionne un groupe WA\n" +
-  "`/status` — État de la connexion\n" +
-  "`/qr` — Force la régénération et l'envoi du QR code de connexion WhatsApp\n" +
-  "`/connexion <numero>` — Connecte WhatsApp sans QR : reçois un code de couplage en MP\n" +
-  "`/link <pseudo> <numero>` — Lie ton pseudo Discord à ton numéro WhatsApp (sync des @)\n" +
-  "`/help` — Cette aide\n\n" +
+  "`/ping` - Latence du bot\n" +
+  "`/groupes` - Liste les groupes WA\n" +
+  "`/select <n>` - Selectionne un groupe WA\n" +
+  "`/status` - Etat de la connexion\n" +
+  "`/qr` - Force la regeneration et l'envoi du QR code de connexion WhatsApp\n" +
+  "`/connexion <numero>` - Connecte WhatsApp sans QR : recois un code de couplage en MP\n" +
+  "`/link <pseudo> <numero>` - Lie ton pseudo Discord a ton numero WhatsApp (sync des @)\n" +
+  "`/help` - Cette aide\n\n" +
   "**Commandes `!` (Discord & WA) :**\n" +
-  "`!txt` — Transcrit un message vocal (reply sur le vocal)\n" +
-  "`!mute @Membre 2h` — Mute un membre (admins WA)\n" +
-  "`!unmute @Membre` — Unmute un membre (admins WA)\n" +
-  "`!groupes` / `!select <n>` / `!status` / `!help` — Commandes bridge\n\n" +
-  "**Sondages :** un sondage créé sur Discord est recréé automatiquement comme vrai sondage WhatsApp, " +
-  "et un sondage WhatsApp est relayé sur Discord sous forme de message (question + options).";
+  "`!txt` - Transcrit un message vocal (reply sur le vocal)\n" +
+  "`!mute @Membre 2h` - Mute un membre (admins WA)\n" +
+  "`!unmute @Membre` - Unmute un membre (admins WA)\n" +
+  "`!groupes` / `!select <n>` / `!status` / `!help` - Commandes bridge\n\n" +
+  "**Sondages :** un sondage cree sur Discord est recree automatiquement comme vrai sondage WhatsApp, " +
+  "et un sondage WhatsApp est relaye sur Discord sous forme de message (question + options).";
 
 discordClient.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.channelId !== DISCORD_CHANNEL_ID) {
     try {
-      await interaction.reply({ content: "❌ Utilise cette commande dans le bon salon.", ephemeral: true });
+      await interaction.reply({ content: "Utilise cette commande dans le bon salon.", ephemeral: true });
     } catch (_) {}
     return;
   }
@@ -936,7 +1045,7 @@ discordClient.on("interactionCreate", async (interaction) => {
 
   if (commandName === "ping") {
     const latency = Date.now() - interaction.createdTimestamp;
-    await safeReply(`🏓 Pong ! Latence : **${latency}ms** | WebSocket : **${discordClient.ws.ping}ms**`);
+    await safeReply(`Pong ! Latence : **${latency}ms** | WebSocket : **${discordClient.ws.ping}ms**`);
     return;
   }
 
@@ -951,7 +1060,7 @@ discordClient.on("interactionCreate", async (interaction) => {
       const numero = normalizeWaNumber(interaction.options.getString("numero"));
 
       if (!numero || numero.length < 8) {
-        await safeReply({ content: "❌ Numéro WhatsApp invalide. Exemple : `33612345678`", ephemeral: true });
+        await safeReply({ content: "Numero WhatsApp invalide. Exemple : `33612345678`", ephemeral: true });
         return;
       }
 
@@ -969,26 +1078,26 @@ discordClient.on("interactionCreate", async (interaction) => {
 
       setLink(discordId, resolvedName, numero);
       await safeReply({
-        content: `✅ Lien créé : **${resolvedName}** ↔ **+${numero}**\nLes mentions \`@\` seront désormais correctement synchronisées entre Discord et WhatsApp.`,
+        content: `Lien cree : **${resolvedName}** **+${numero}**\nLes mentions \`@\` seront desormais correctement synchronisees entre Discord et WhatsApp.`,
         ephemeral: true,
       });
     } catch (e) {
       logError("Erreur /link", e);
-      await safeReply({ content: `❌ Erreur : ${e.message}`, ephemeral: true });
+      await safeReply({ content: `Erreur : ${e.message}`, ephemeral: true });
     }
     return;
   }
 
   if (commandName === "qr") {
     if (waReady) {
-      await safeReply("✅ WhatsApp est déjà connecté, pas besoin de QR code.\nSi tu veux quand même reconnecter avec un nouveau numéro, utilise `/qr` après avoir déconnecté l'appareil lié depuis WhatsApp > Appareils connectés.");
+      await safeReply("WhatsApp est deja connecte, pas besoin de QR code.\nSi tu veux quand meme reconnecter avec un nouveau numero, utilise `/qr` apres avoir deconnecte l'appareil lie depuis WhatsApp > Appareils connectes.");
       return;
     }
     if (waRestartInProgress) {
-      await safeReply("⏳ Le client WhatsApp est en cours de (re)démarrage, patiente quelques secondes et réessaie — le QR arrivera automatiquement s'il en faut un.");
+      await safeReply("Le client WhatsApp est en cours de (re)demarrage, patiente quelques secondes et reessaie - le QR arrivera automatiquement s'il en faut un.");
       return;
     }
-    await safeReply("🔄 Régénération du QR code en cours... il sera envoyé sur ce salon dans quelques secondes.");
+    await safeReply("Regeneration du QR code en cours... il sera envoye sur ce salon dans quelques secondes.");
     forceQrResend();
     return;
   }
@@ -996,15 +1105,15 @@ discordClient.on("interactionCreate", async (interaction) => {
   if (commandName === "connexion") {
     const numero = normalizeWaNumber(interaction.options.getString("numero"));
     if (!numero || numero.length < 8) {
-      await safeReply({ content: "❌ Numéro invalide. Exemple : `33612345678` (indicatif pays + numéro, sans le `+` ni espaces).", ephemeral: true });
+      await safeReply({ content: "Numero invalide. Exemple : `33612345678` (indicatif pays + numero, sans le `+` ni espaces).", ephemeral: true });
       return;
     }
     if (waReady) {
-      await safeReply({ content: "✅ WhatsApp est déjà connecté, pas besoin de code de couplage.", ephemeral: true });
+      await safeReply({ content: "WhatsApp est deja connecte, pas besoin de code de couplage.", ephemeral: true });
       return;
     }
     if (waRestartInProgress) {
-      await safeReply({ content: "⏳ Le client WhatsApp est en cours de (re)démarrage, patiente quelques secondes et réessaie.", ephemeral: true });
+      await safeReply({ content: "Le client WhatsApp est en cours de (re)demarrage, patiente quelques secondes et reessaie.", ephemeral: true });
       return;
     }
 
@@ -1019,18 +1128,18 @@ discordClient.on("interactionCreate", async (interaction) => {
       const code = await sock.requestPairingCode(numero);
       try {
         await interaction.user.send(
-          `🔑 Ton code de couplage WhatsApp : **${code}**\n\n` +
-          "Sur ton téléphone : ouvre **WhatsApp** > *Réglages* > *Appareils connectés* > *Lier un appareil* > " +
-          "**« Lier avec le numéro de téléphone à la place »** > entre ce code.\n" +
-          "⏱️ Il expire au bout de quelques minutes, fais vite."
+          `Ton code de couplage WhatsApp : **${code}**\n\n` +
+          "Sur ton telephone : ouvre **WhatsApp** > *Reglages* > *Appareils connectes* > *Lier un appareil* > " +
+          "**Lier avec le numero de telephone a la place** > entre ce code.\n" +
+          "Il expire au bout de quelques minutes, fais vite."
         );
-        await safeReply({ content: "✅ Le code de couplage t'a été envoyé en message privé." });
+        await safeReply({ content: "Le code de couplage t'a ete envoye en message prive." });
       } catch (dmError) {
-        await safeReply({ content: `❌ Impossible de t'envoyer un MP (vérifie que tes messages privés sont ouverts pour ce serveur). Ton code : **${code}**` });
+        await safeReply({ content: `Impossible de t'envoyer un MP (verifie que tes messages prives sont ouverts pour ce serveur). Ton code : **${code}**` });
       }
     } catch (e) {
       logError("Erreur /connexion (requestPairingCode)", e);
-      await safeReply({ content: `❌ Erreur lors de la génération du code : ${e.message}` });
+      await safeReply({ content: `Erreur lors de la generation du code : ${e.message}` });
     }
     return;
   }
@@ -1047,25 +1156,25 @@ discordClient.on("interactionCreate", async (interaction) => {
       const group = await getSelectedGroup();
       await safeReply(
         waReady
-          ? `✅ WhatsApp connecté\n📌 Groupe : **${group ? group.name : "aucun sélectionné"}**`
-          : "❌ WhatsApp non connecté"
+          ? `WhatsApp connecte\nGroupe : **${group ? group.name : "aucun selectionne"}**`
+          : "WhatsApp non connecte"
       );
     } catch (e) {
       logError("Erreur /status", e);
-      await safeReply(`❌ Erreur : ${e.message}`);
+      await safeReply(`Erreur : ${e.message}`);
     }
     return;
   }
 
   if (commandName === "groupes") {
     if (!waReady) {
-      await safeReply("⏳ WhatsApp n'est pas encore prêt (session en cours d'initialisation). Réessaie dans quelques secondes, ou utilise `/status` pour vérifier.");
+      await safeReply("WhatsApp n'est pas encore pret (session en cours d'initialisation). Reessaie dans quelques secondes, ou utilise `/status` pour verifier.");
       return;
     }
     try {
       const groups = await getWaGroups();
       if (!groups.length) {
-        await safeReply("Aucun groupe trouvé.");
+        await safeReply("Aucun groupe trouve.");
         return;
       }
       const txt = "**Groupes disponibles :**\n" +
@@ -1079,20 +1188,20 @@ discordClient.on("interactionCreate", async (interaction) => {
 
   if (commandName === "select") {
     if (!waReady) {
-      await safeReply("⏳ WhatsApp n'est pas encore prêt (session en cours d'initialisation). Réessaie dans quelques secondes, ou utilise `/status` pour vérifier.");
+      await safeReply("WhatsApp n'est pas encore pret (session en cours d'initialisation). Reessaie dans quelques secondes, ou utilise `/status` pour verifier.");
       return;
     }
     try {
       const index  = interaction.options.getInteger("numero") - 1;
       const groups = await getWaGroups();
       if (Number.isNaN(index) || !groups[index]) {
-        await safeReply("❌ Numéro invalide. Utilise `/groupes`.");
+        await safeReply("Numero invalide. Utilise `/groupes`.");
         return;
       }
       selectedGroupId = groups[index].id._serialized;
       saveSelectedGroup();
       invalidateGroupCache();
-      await safeReply(`✅ Groupe sélectionné : **${groups[index].name}**`);
+      await safeReply(`Groupe selectionne : **${groups[index].name}**`);
     } catch (e) {
       await safeReply(friendlyWaErrorReply(e));
     }
@@ -1105,12 +1214,13 @@ discordClient.on("interactionCreate", async (interaction) => {
 // ==========================================================================
 
 async function startWaSocket() {
+  clearPendingReconnect();
   waRestartInProgress = true;
 
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+  const newSock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
@@ -1121,95 +1231,138 @@ async function startWaSocket() {
     syncFullHistory: false,
     markOnlineOnConnect: false,
     msgRetryCounterCache: new NodeCache(),
+    // Laisse Baileys gerer lui-meme son ping/pong interne (keepalive) ;
+    // on ne le desactive/modifie pas, c'est ce qui permet de detecter
+    // une connexion morte plus vite qu'un timeout TCP classique.
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  // On fige la reference : si un autre socket est cree entre-temps (ne devrait
+  // plus arriver avec le point d'entree unique, mais on se protege quand meme
+  // contre des events tardifs d'un ancien socket), on ignore les events perimes.
+  sock = newSock;
 
-  sock.ev.on("contacts.upsert", (contacts) => {
+  newSock.ev.on("creds.update", saveCreds);
+
+  newSock.ev.on("contacts.upsert", (contacts) => {
     for (const c of contacts) {
-      if (c.id && (c.name || c.notify)) contactNamesCache.set(c.id, c.name || c.notify);
+      if (!c.id) continue;
+      if (c.name) contactSavedNameCache.set(c.id, c.name);
+      if (c.notify) contactNotifyNameCache.set(c.id, c.notify);
     }
   });
-  sock.ev.on("contacts.update", (contacts) => {
+  newSock.ev.on("contacts.update", (contacts) => {
     for (const c of contacts) {
-      if (c.id && (c.name || c.notify)) contactNamesCache.set(c.id, c.name || c.notify);
+      if (!c.id) continue;
+      // Une mise a jour partielle (ex: juste le notify qui change) ne doit
+      // jamais effacer le nom que Pkai a donne au contact.
+      if (c.name) contactSavedNameCache.set(c.id, c.name);
+      if (c.notify) contactNotifyNameCache.set(c.id, c.notify);
     }
   });
 
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  newSock.ev.on("connection.update", async (update) => {
+    if (sock !== newSock) return; // event d'un socket perime, on ignore
+    try {
+      const { connection, lastDisconnect, qr } = update;
 
-    if (qr) {
-      waRestartInProgress = false;
-      try {
-        console.log("QR code reçu, génération en cours...");
-        const dataUrl = await qrcode.toDataURL(qr);
-        const base64  = dataUrl.replace(/^data:image\/png;base64,/, "");
-        fs.writeFileSync("qr.png", base64, "base64");
-        const channel = await getDiscordChannel();
-        await channel.send({ content: "Scanne ce QR code pour connecter WhatsApp", files: ["qr.png"] });
-        console.log("QR code envoyé sur Discord.");
-      } catch (e) {
-        logError("Erreur QR", e);
-      }
-    }
-
-    if (connection === "open") {
-      console.log("WhatsApp connecté");
-      waRestartInProgress = false;
-      await new Promise((r) => setTimeout(r, 5000));
-      startTimestamp = Math.floor(Date.now() / 1000);
-      waReady = true;
-      console.log("WhatsApp prêt");
-    }
-
-    if (connection === "close") {
-      waReady = false;
-      invalidateGroupCache();
-
-      const statusCode = lastDisconnect && lastDisconnect.error instanceof Boom
-        ? lastDisconnect.error.output.statusCode
-        : null;
-
-      const needsFreshSession =
-        statusCode === DisconnectReason.loggedOut ||
-        statusCode === DisconnectReason.badSession;
-
-      const errMsg = lastDisconnect && lastDisconnect.error ? lastDisconnect.error.message : "raison inconnue";
-      console.warn(`WhatsApp déconnecté, code : ${statusCode} — ${errMsg}`);
-
-      try {
-        const channel = await getDiscordChannel();
-        await channel.send(
-          needsFreshSession
-            ? `⚠️ Session WhatsApp invalidée (code ${statusCode}). Nettoyage et reconnexion... Utilise \`/qr\` ou \`/connexion\` si besoin de rescanner.`
-            : "⚠️ Le pont WhatsApp a rencontré un problème et se reconnecte automatiquement..."
-        );
-      } catch (_) {}
-
-      if (needsFreshSession) {
-        try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+      if (qr) {
+        clearPendingReconnect();
         waRestartInProgress = false;
-        if (statusCode === DisconnectReason.badSession) {
-          setTimeout(() => {
-            startWaSocket().catch((e) => {
-              logError("Erreur reconnexion WA après badSession", e);
-              waRestartInProgress = false;
-            });
-          }, 5000);
+        try {
+          console.log("QR code recu, generation en cours...");
+          const dataUrl = await qrcode.toDataURL(qr);
+          const base64  = dataUrl.replace(/^data:image\/png;base64,/, "");
+          fs.writeFileSync("qr.png", base64, "base64");
+          const channel = await getDiscordChannel();
+          await channel.send({ content: "Scanne ce QR code pour connecter WhatsApp", files: ["qr.png"] });
+          console.log("QR code envoye sur Discord.");
+        } catch (e) {
+          logError("Erreur QR", e);
         }
-      } else {
-        setTimeout(() => {
-          startWaSocket().catch((e) => {
-            logError("Erreur reconnexion WA", e);
-            waRestartInProgress = false;
-          });
-        }, 5000);
+      }
+
+      if (connection === "open") {
+        console.log("WhatsApp connecte");
+        clearPendingReconnect();
+        waRestartInProgress = false;
+        reconnectAttempts = 0;
+        discordNotifiedThisCycle = false;
+        await new Promise((r) => setTimeout(r, 5000));
+        if (sock !== newSock) return; // reconnecte entre-temps, on abandonne
+        startTimestamp = Math.floor(Date.now() / 1000);
+        waReady = true;
+        console.log("WhatsApp pret");
+      }
+
+      if (connection === "close") {
+        waReady = false;
+        invalidateGroupCache();
+
+        const statusCode = lastDisconnect && lastDisconnect.error instanceof Boom
+          ? lastDisconnect.error.output.statusCode
+          : null;
+        const errMsg = lastDisconnect && lastDisconnect.error ? lastDisconnect.error.message : "raison inconnue";
+        console.warn(`WhatsApp deconnecte, code : ${statusCode} - ${errMsg}`);
+
+        const needsFreshSession =
+          statusCode === DisconnectReason.loggedOut ||
+          statusCode === DisconnectReason.badSession ||
+          statusCode === DisconnectReason.multideviceMismatch;
+
+        // restartRequired arrive normalement juste apres un scan de QR / pairing :
+        // c'est un evenement attendu, pas une panne. On reconnecte tout de suite
+        // sans spammer le salon Discord ni toucher au backoff.
+        const isBenignRestart = statusCode === DisconnectReason.restartRequired;
+
+        // connectionReplaced = un autre socket s'est connecte avec la meme
+        // session (double instance du bot, ou ancien process PM2 pas kille).
+        // Reconnecter en boucle serree ne ferait que se battre avec l'autre
+        // connexion : on garde un backoff plus large ici.
+        const isConflict = statusCode === DisconnectReason.connectionReplaced;
+
+        if (needsFreshSession) {
+          notifyDiscordOnce(
+            `Session WhatsApp invalidee (code ${statusCode}). Nettoyage de la session et reconnexion... ` +
+            "Utilise /qr ou /connexion pour rescanner/relier l'appareil."
+          ).catch(() => {});
+          scheduleReconnect(`session invalide (${statusCode}): ${errMsg}`, { clearSession: true, immediate: true });
+          return;
+        }
+
+        if (isBenignRestart) {
+          scheduleReconnect(`restartRequired: ${errMsg}`, { immediate: true });
+          return;
+        }
+
+        if (isConflict) {
+          notifyDiscordOnce(
+            `WhatsApp signale qu'une autre connexion a pris le relais (code ${statusCode}). ` +
+            "Verifie qu'il n'y a pas deux instances du bot qui tournent (ex: doublon PM2). Nouvelle tentative dans quelques instants..."
+          ).catch(() => {});
+          // On force un delai minimum plus long que le backoff de base pour laisser
+          // le temps a l'eventuelle autre instance de se stabiliser ou de crasher.
+          reconnectAttempts = Math.max(reconnectAttempts, 2);
+          scheduleReconnect(`connectionReplaced: ${errMsg}`);
+          return;
+        }
+
+        notifyDiscordOnce("Le pont WhatsApp a rencontre un probleme et se reconnecte automatiquement...").catch(() => {});
+        scheduleReconnect(`${statusCode || "close"}: ${errMsg}`);
+      }
+    } catch (e) {
+      // Filet de securite absolu : quoi qu'il arrive, si le traitement de
+      // connection.update plante, on ne doit JAMAIS rester sans reconnexion
+      // programmee (sinon le pont reste "mort" en silence tant qu'un humain
+      // ne redemarre pas PM2 - ce qui ressemble a un crash de l'exterieur).
+      logError("Erreur interne dans connection.update", e);
+      if (!reconnectTimer) {
+        scheduleReconnect(`erreur interne connection.update: ${e.message}`);
       }
     }
   });
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+  newSock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (sock !== newSock) return;
     if (type !== "notify") return;
     for (const m of messages) {
       try {
@@ -1220,7 +1373,7 @@ async function startWaSocket() {
     }
   });
 
-  return sock;
+  return newSock;
 }
 
 // ==========================================================================
@@ -1282,7 +1435,7 @@ async function handleIncomingWaMessage(msg) {
   }
 
   if (isMuted(senderJid)) {
-    log("MUTE_BLOCK", name, "Message supprimé (mute actif)");
+    log("MUTE_BLOCK", name, "Message supprime (mute actif)");
     try { await sock.sendMessage(jid, { delete: msg.key }); } catch (e) { logError("Erreur suppression message mute", e); }
     return;
   }
@@ -1306,10 +1459,10 @@ async function handleWaProtocolMessage(msg) {
     const newText = proto_.editedMessage ? extractText({ message: proto_.editedMessage }) : "";
     try {
       const senderJid = msg.key.participant || jid;
-      const name = contactNamesCache.get(senderJid) || (senderJid ? senderJid.split("@")[0] : "Inconnu");
-      await webhook.editMessage(discordId, { content: `${name} : ${newText || "[MEDIA]"} *(édité)*` });
+      const name = getContactDisplayName(senderJid);
+      await webhook.editMessage(discordId, { content: `${name} : ${newText || "[MEDIA]"} *(edite)*` });
     } catch (e) {
-      if (!e.message.includes("Unknown Message")) logError("Erreur édition WA->DC", e);
+      if (!e.message.includes("Unknown Message")) logError("Erreur edition WA->DC", e);
     }
     return;
   }
@@ -1331,7 +1484,7 @@ async function handleWaProtocolMessage(msg) {
 async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
   const adminCheck = isGroupAdmin(senderJid, group);
   if (!adminCheck) {
-    await group.sendMessage("❌ Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
+    await group.sendMessage("Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
     return;
   }
 
@@ -1340,7 +1493,7 @@ async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
   const durationMs  = parseDuration(durationStr);
   if (!durationMs) {
     await group.sendMessage(
-      "❌ Format invalide. Exemple : `!mute @Personne 2d`\nUnités : m (minutes), h (heures), d (jours)",
+      "Format invalide. Exemple : `!mute @Personne 2d`\nUnites : m (minutes), h (heures), d (jours)",
       { quotedMessageId: waId }
     );
     return;
@@ -1348,26 +1501,26 @@ async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
 
   const targetJid = resolveMentionedJid(msg);
   if (!targetJid) {
-    await group.sendMessage("❌ Mentionne un membre avec @.", { quotedMessageId: waId });
+    await group.sendMessage("Mentionne un membre avec @.", { quotedMessageId: waId });
     return;
   }
 
-  const targetName    = contactNamesCache.get(targetJid) || targetJid.split("@")[0];
+  const targetName    = getContactDisplayName(targetJid);
   const targetIsAdmin = isGroupAdmin(targetJid, group);
   if (targetIsAdmin) {
-    await group.sendMessage("❌ Impossible de muter un admin du groupe.", { quotedMessageId: waId });
+    await group.sendMessage("Impossible de muter un admin du groupe.", { quotedMessageId: waId });
     return;
   }
 
   const expireAt = Date.now() + durationMs;
   mutedUsers[targetJid] = expireAt;
   saveMutes();
-  log("MUTE", name, `${targetName} muté jusqu'au ${formatExpire(expireAt)}`);
+  log("MUTE", name, `${targetName} mute jusqu'au ${formatExpire(expireAt)}`);
 
   await group.sendMessage(
-    `🔇 *${targetName}* est mute jusqu'au *${formatExpire(expireAt)}*.\n` +
-    "Ses messages seront automatiquement supprimés.\n" +
-    `Un admin peut le démuter avec \`!unmute @${targetName}\`.`,
+    `*${targetName}* est mute jusqu'au *${formatExpire(expireAt)}*.\n` +
+    "Ses messages seront automatiquement supprimes.\n" +
+    `Un admin peut le demuter avec \`!unmute @${targetName}\`.`,
     { quotedMessageId: waId }
   );
 }
@@ -1375,28 +1528,78 @@ async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
 async function handleUnmuteCommand(msg, group, senderJid, name, waId) {
   const adminCheck = isGroupAdmin(senderJid, group);
   if (!adminCheck) {
-    await group.sendMessage("❌ Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
+    await group.sendMessage("Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
     return;
   }
 
   const targetJid = resolveMentionedJid(msg);
   if (!targetJid) {
-    await group.sendMessage("❌ Mentionne un membre avec @.", { quotedMessageId: waId });
+    await group.sendMessage("Mentionne un membre avec @.", { quotedMessageId: waId });
     return;
   }
 
-  const targetName = contactNamesCache.get(targetJid) || targetJid.split("@")[0];
+  const targetName = getContactDisplayName(targetJid);
 
   if (mutedUsers[targetJid]) {
     delete mutedUsers[targetJid];
     saveMutes();
-    log("UNMUTE", name, `${targetName} démuté par ${name}`);
+    log("UNMUTE", name, `${targetName} demute par ${name}`);
     await group.sendMessage(
-      `🔊 *${targetName}* a été démuté par *${name}*.\nIl peut de nouveau envoyer des messages.`,
+      `*${targetName}* a ete demute par *${name}*.\nIl peut de nouveau envoyer des messages.`,
       { quotedMessageId: waId }
     );
   } else {
-    await group.sendMessage(`ℹ️ *${targetName}* n'est pas mute.`, { quotedMessageId: waId });
+    await group.sendMessage(`*${targetName}* n'est pas mute.`, { quotedMessageId: waId });
+  }
+}
+
+async function relayWaPollToDiscord(msg, name, waId) {
+  const data = extractWaPollData(msg);
+  if (!data) {
+    log("WA->DC", name, "[SONDAGE] Format de sondage non reconnu, ignore.");
+    return;
+  }
+
+  let answers = data.options;
+  if (answers.length > DISCORD_POLL_MAX_ANSWERS) {
+    log("WA->DC", name, `[SONDAGE] ${answers.length} options tronquees a ${DISCORD_POLL_MAX_ANSWERS} (limite Discord)`);
+    answers = answers.slice(0, DISCORD_POLL_MAX_ANSWERS);
+  }
+
+  log("WA->DC", name, `[SONDAGE] ${data.question}`);
+
+  try {
+    // Un sondage natif Discord ne peut pas etre cree via un webhook (l'API
+    // ne le supporte pas), donc on passe par le bot lui-meme. Le nom de
+    // l'auteur WA est mis dans le message qui accompagne le sondage.
+    const channel = await getDiscordChannel();
+    const sent = await channel.send({
+      content: `**${name}** a cree un sondage WhatsApp :`,
+      poll: {
+        question: { text: data.question },
+        answers: answers.map((text) => ({ text })),
+        duration: 168, // 7 jours
+        allowMultiselect: data.multi,
+      },
+    });
+    waToDiscord.set(waId, sent.id);
+    discordToWa.set(sent.id, waId);
+  } catch (e) {
+    logError("Erreur creation sondage Discord depuis WA", e);
+    // Filet de secours : si la creation du vrai sondage echoue (ex: version
+    // de discord.js trop ancienne pour supporter les sondages natifs), on
+    // relaie au moins le texte du sondage pour ne rien perdre.
+    try {
+      const fallbackText = formatWaPoll(msg) || "Sondage WhatsApp";
+      const webhookOptions = { username: name, content: fallbackText };
+      const avatarUrl = await getContactAvatarUrl(getSenderJid(msg));
+      if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
+      const sent = await webhook.send(webhookOptions);
+      waToDiscord.set(waId, sent.id);
+      discordToWa.set(sent.id, waId);
+    } catch (e2) {
+      logError("Erreur fallback texte sondage WA->DC", e2);
+    }
   }
 }
 
@@ -1412,13 +1615,7 @@ async function relayWaMessageToDiscord(msg, senderJid, name, rawText, waId) {
   const kind = getWaMessageKind(msg);
 
   if (kind === "poll") {
-    const pollText = formatWaPoll(msg) || "📊 Sondage WhatsApp";
-    log("WA->DC", name, "[SONDAGE] " + pollText.replace(/\n/g, " | "));
-    const webhookOptions = { username: name, content: pollText };
-    if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
-    const sent = await webhook.send(webhookOptions);
-    waToDiscord.set(waId, sent.id);
-    discordToWa.set(sent.id, waId);
+    await relayWaPollToDiscord(msg, name, waId);
     return;
   }
 
@@ -1432,8 +1629,8 @@ async function relayWaMessageToDiscord(msg, senderJid, name, rawText, waId) {
         const webhookOptions = {
           username: name,
           content: transcript
-            ? `🎙️ *Message vocal :*\n> ${transcript}`
-            : "🎙️ *Message vocal* — réponds avec `!txt` pour transcrire",
+            ? `*Message vocal :*\n> ${transcript}`
+            : "*Message vocal* - reponds avec `!txt` pour transcrire",
           files: [{ attachment: filepath, name: filename }],
         };
         if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
@@ -1511,13 +1708,13 @@ async function buildWaMediaPayload(url, filename, caption) {
 async function handleDiscordBangCommands(message, content) {
   if (content === "!groupes") {
     if (!waReady) {
-      await message.reply("⏳ WhatsApp n'est pas encore prêt (session en cours d'initialisation). Réessaie dans quelques secondes.");
+      await message.reply("WhatsApp n'est pas encore pret (session en cours d'initialisation). Reessaie dans quelques secondes.");
       return true;
     }
     try {
       const groups = await getWaGroups();
       if (!groups.length) {
-        await message.reply("Aucun groupe trouvé.");
+        await message.reply("Aucun groupe trouve.");
       } else {
         const txt = "Groupes disponibles :\n" + groups.map((g, i) => `${i + 1}. ${g.name}`).join("\n");
         await message.reply(txt);
@@ -1530,19 +1727,19 @@ async function handleDiscordBangCommands(message, content) {
 
   if (content.startsWith("!select ")) {
     if (!waReady) {
-      await message.reply("⏳ WhatsApp n'est pas encore prêt (session en cours d'initialisation). Réessaie dans quelques secondes.");
+      await message.reply("WhatsApp n'est pas encore pret (session en cours d'initialisation). Reessaie dans quelques secondes.");
       return true;
     }
     try {
       const index  = parseInt(content.split(" ")[1], 10) - 1;
       const groups = await getWaGroups();
       if (Number.isNaN(index) || !groups[index]) {
-        await message.reply("Numéro invalide. Utilise /groupes.");
+        await message.reply("Numero invalide. Utilise /groupes.");
       } else {
         selectedGroupId = groups[index].id._serialized;
         saveSelectedGroup();
         invalidateGroupCache();
-        await message.reply(`Groupe sélectionné : ${groups[index].name}`);
+        await message.reply(`Groupe selectionne : ${groups[index].name}`);
       }
     } catch (e) {
       await message.reply(friendlyWaErrorReply(e));
@@ -1554,7 +1751,7 @@ async function handleDiscordBangCommands(message, content) {
     try {
       const group = await getSelectedGroup();
       await message.reply(
-        waReady ? `WhatsApp connecté\nGroupe : ${group ? group.name : "aucun sélectionné"}` : "WhatsApp non connecté"
+        waReady ? `WhatsApp connecte\nGroupe : ${group ? group.name : "aucun selectionne"}` : "WhatsApp non connecte"
       );
     } catch (e) {
       logError("Erreur !status", e);
@@ -1564,11 +1761,11 @@ async function handleDiscordBangCommands(message, content) {
 
   if (content === "!qr") {
     if (waReady) {
-      await message.reply("✅ WhatsApp est déjà connecté, pas besoin de QR code.");
+      await message.reply("WhatsApp est deja connecte, pas besoin de QR code.");
     } else if (waRestartInProgress) {
-      await message.reply("⏳ Le client WhatsApp est en cours de (re)démarrage, patiente quelques secondes et réessaie.");
+      await message.reply("Le client WhatsApp est en cours de (re)demarrage, patiente quelques secondes et reessaie.");
     } else {
-      await message.reply("🔄 Régénération du QR code en cours... il sera envoyé sur ce salon dans quelques secondes.");
+      await message.reply("Regeneration du QR code en cours... il sera envoye sur ce salon dans quelques secondes.");
       forceQrResend();
     }
     return true;
@@ -1582,13 +1779,13 @@ async function handleDiscordBangCommands(message, content) {
   if (content === "!help") {
     await message.reply(
       "Commandes disponibles :\n" +
-      "`!txt` — Transcrit un message vocal (reply sur le message audio)\n" +
-      "`!groupes` — Liste les groupes WA\n" +
-      "`!select <n>` — Sélectionne un groupe WA\n" +
-      "`!status` — Etat connexion\n" +
-      "`!qr` — Force l'envoi du QR code de connexion WhatsApp\n" +
-      "`!connexion <numero>` — Connecte WhatsApp sans QR : reçois un code de couplage en MP\n" +
-      "`!help` — Cette aide\n" +
+      "`!txt` - Transcrit un message vocal (reply sur le message audio)\n" +
+      "`!groupes` - Liste les groupes WA\n" +
+      "`!select <n>` - Selectionne un groupe WA\n" +
+      "`!status` - Etat connexion\n" +
+      "`!qr` - Force l'envoi du QR code de connexion WhatsApp\n" +
+      "`!connexion <numero>` - Connecte WhatsApp sans QR : recois un code de couplage en MP\n" +
+      "`!help` - Cette aide\n" +
       "Slash : `/ping` `/groupes` `/select` `/status` `/link` `/qr` `/connexion` `/help`"
     );
     return true;
@@ -1600,15 +1797,15 @@ async function handleDiscordBangCommands(message, content) {
 async function handleBangConnexion(message, content) {
   const numero = normalizeWaNumber(content.split(" ")[1] || "");
   if (!numero || numero.length < 8) {
-    await message.reply("❌ Numéro invalide. Exemple : `!connexion 33612345678` (indicatif pays + numéro, sans le `+` ni espaces).");
+    await message.reply("Numero invalide. Exemple : `!connexion 33612345678` (indicatif pays + numero, sans le `+` ni espaces).");
     return;
   }
   if (waReady) {
-    await message.reply("✅ WhatsApp est déjà connecté, pas besoin de code de couplage.");
+    await message.reply("WhatsApp est deja connecte, pas besoin de code de couplage.");
     return;
   }
   if (waRestartInProgress) {
-    await message.reply("⏳ Le client WhatsApp est en cours de (re)démarrage, patiente quelques secondes et réessaie.");
+    await message.reply("Le client WhatsApp est en cours de (re)demarrage, patiente quelques secondes et reessaie.");
     return;
   }
 
@@ -1616,18 +1813,18 @@ async function handleBangConnexion(message, content) {
     const code = await sock.requestPairingCode(numero);
     try {
       await message.author.send(
-        `🔑 Ton code de couplage WhatsApp : **${code}**\n\n` +
-        "Sur ton téléphone : ouvre **WhatsApp** > *Réglages* > *Appareils connectés* > *Lier un appareil* > " +
-        "**« Lier avec le numéro de téléphone à la place »** > entre ce code.\n" +
-        "⏱️ Il expire au bout de quelques minutes, fais vite."
+        `Ton code de couplage WhatsApp : **${code}**\n\n` +
+        "Sur ton telephone : ouvre **WhatsApp** > *Reglages* > *Appareils connectes* > *Lier un appareil* > " +
+        "**Lier avec le numero de telephone a la place** > entre ce code.\n" +
+        "Il expire au bout de quelques minutes, fais vite."
       );
-      await message.reply("✅ Le code de couplage t'a été envoyé en message privé.");
+      await message.reply("Le code de couplage t'a ete envoye en message prive.");
     } catch (dmError) {
-      await message.reply(`❌ Impossible de t'envoyer un MP (vérifie que tes messages privés sont ouverts). Ton code : **${code}**`);
+      await message.reply(`Impossible de t'envoyer un MP (verifie que tes messages prives sont ouverts). Ton code : **${code}**`);
     }
   } catch (e) {
     logError("Erreur !connexion (requestPairingCode)", e);
-    await message.reply(`❌ Erreur lors de la génération du code : ${e.message}`);
+    await message.reply(`Erreur lors de la generation du code : ${e.message}`);
   }
 }
 
@@ -1641,7 +1838,7 @@ async function relayDiscordPollToWa(message, group, name) {
       .slice(0, 12);
 
     if (answers.length < 2) {
-      log("DC->WA_ERROR", name, "Sondage ignoré (moins de 2 options valides)");
+      log("DC->WA_ERROR", name, "Sondage ignore (moins de 2 options valides)");
       return;
     }
 
@@ -1656,7 +1853,7 @@ async function relayDiscordPollToWa(message, group, name) {
       discordToWa.set(message.id, sent.key.id);
       log("DC->WA", name, `[SONDAGE] ${question}`);
     } else {
-      log("DC->WA_FAIL", name, `Sondage non envoyé : ${question}`);
+      log("DC->WA_FAIL", name, `Sondage non envoye : ${question}`);
     }
   } catch (e) {
     log("DC->WA_ERROR", name, `ERREUR sondage: ${e.message}`);
@@ -1672,7 +1869,7 @@ async function relayDiscordMessageToWa(message, group, name, content) {
   }
 
   if (content && content.includes("@here")) {
-    log("DC->WA_BLOCKED", name, `Message ignoré (contient @here) : ${content}`);
+    log("DC->WA_BLOCKED", name, `Message ignore (contient @here) : ${content}`);
     return;
   }
 
@@ -1742,7 +1939,7 @@ discordClient.on("messageUpdate", async (_, newMessage) => {
   try {
     await sock.sendMessage(stored.key.remoteJid, { text: newMessage.content, edit: stored.key });
   } catch (e) {
-    logError("Erreur édition DC->WA", e);
+    logError("Erreur edition DC->WA", e);
   }
 });
 
@@ -1781,7 +1978,7 @@ discordClient.on("messageCreate", async (message) => {
   if (message.poll) {
     const group = await getSelectedGroup();
     if (!group) {
-      await message.reply("Aucun groupe sélectionné. Utilise `/select <n>`.");
+      await message.reply("Aucun groupe selectionne. Utilise `/select <n>`.");
       return;
     }
     await relayDiscordPollToWa(message, group, name);
@@ -1797,7 +1994,7 @@ discordClient.on("messageCreate", async (message) => {
 
   const group = await getSelectedGroup();
   if (!group) {
-    await message.reply("Aucun groupe sélectionné. Utilise `/select <n>`.");
+    await message.reply("Aucun groupe selectionne. Utilise `/select <n>`.");
     return;
   }
 
@@ -1813,10 +2010,11 @@ loadLinks();
 loadMutes();
 
 discordClient.login(DISCORD_TOKEN)
-  .then(() => console.log("Connexion Discord lancée"))
+  .then(() => console.log("Connexion Discord lancee"))
   .catch((e) => logError("Erreur connexion Discord", e));
 
 startWaSocket().catch((e) => {
   logError("Erreur initialisation WA", e);
   waRestartInProgress = false;
+  scheduleReconnect(`echec demarrage initial: ${e.message}`);
 });
