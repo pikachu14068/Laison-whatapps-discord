@@ -1,6 +1,6 @@
 {
   "name": "bridge-discord-whatsapp",
-  "version": "3.1.3",
+  "version": "3.2.3",
   "description": "Pont Discord <-> WhatsApp",
   "main": "bot.js",
   "scripts": {

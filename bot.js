@@ -14,6 +14,9 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require("discord.js");
 
 const {
@@ -29,6 +32,7 @@ const {
   proto,
 } = require("@whiskeysockets/baileys");
 const NodeCache = require("node-cache");
+const { execSync } = require("child_process");
 
 function logTimestamp() {
   return new Date().toLocaleString("fr-FR", { timeZone: "Europe/Paris" });
@@ -69,8 +73,9 @@ const MUTES_FILE = "./mutes.json";
 const GROUP_FILE = "./selected_group.json";
 const LINKS_FILE = "./links.json";
 const AUTH_DIR        = "./wa_auth";
-const AUTH_BACKUP_DIR  = "./wa_auth_backup"; 
-const LOCK_FILE        = "./bot.lock";      
+const AUTH_BACKUP_DIR  = "./wa_auth_backup";
+const LOCK_FILE        = "./bot.lock";
+const UPDATE_STATE_FILE = "./update_state.json";
 
 const GUILD_MEMBERS_CACHE_TTL = 60 * 1000;
 const GROUP_CACHE_TTL         = 60 * 1000;
@@ -123,8 +128,8 @@ const waToDiscord      = new BoundedMap(5000);
 const discordToWa      = new BoundedMap(5000);
 const sentByBridge      = new Set();
 const avatarCache       = new BoundedMap(2000);
-const contactSavedNameCache  = new Map(); // nom que Pkai a donne au contact dans son repertoire (priorite max)
-const contactNotifyNameCache = new Map(); // pseudo que la personne s'est donne elle-meme sur WhatsApp (fallback)
+const contactSavedNameCache  = new Map();
+const contactNotifyNameCache = new Map();
 const waMessageStore    = new BoundedMap(3000);
 
 // ==========================================================================
@@ -157,25 +162,6 @@ function isFatalWaError(message) {
     m.includes("Cannot read properties of undefined")
   );
 }
-
-// --------------------------------------------------------------------------
-// IMPORTANT : il n'existe qu'UN SEUL chemin qui relance startWaSocket() :
-// le handler "connection.update" (connection === "close") dans startWaSocket().
-// Avant, restartWaClient() ET ce handler pouvaient chacun programmer un
-// startWaSocket(), ce qui creait DEUX sockets Baileys en parallele sur la
-// meme session -> WhatsApp tue l'un des deux (connectionReplaced) -> boucle
-// de deconnexion infinie. Toute autre fonction ne fait que DEMANDER la
-// fermeture du socket actuel (sock.end()) ; c'est l'event "close" qui
-// declenche ensuite scheduleReconnect().
-// --------------------------------------------------------------------------
-
-// --------------------------------------------------------------------------
-// VERROU MONO-INSTANCE : deux process qui ecrivent en meme temps dans le
-// meme dossier de session WhatsApp (wa_auth) corrompent les cles locales et
-// provoquent des deconnexions forcees necessitant un nouveau QR code. Ca
-// arrive typiquement si un ancien process n'a pas ete completement tue avant
-// qu'un nouveau demarre (redeploiement, double "pm2 start", crash partiel).
-// --------------------------------------------------------------------------
 
 function isProcessAlive(pid) {
   try {
@@ -215,16 +201,7 @@ function releaseSingleInstanceLock() {
   } catch (_) {}
 }
 
-// --------------------------------------------------------------------------
-// SAUVEGARDE / RESTAURATION DE LA SESSION WHATSAPP
-// Une "badSession" (cles locales corrompues, ex: apres une coupure brutale)
-// n'est pas forcement une vraie deconnexion cote WhatsApp : dans ce cas,
-// restaurer une copie recente et connue-bonne de la session evite d'avoir
-// a rescanner le QR. On ne fait ca qu'UNE fois par cycle : si la restauration
-// echoue aussi, on bascule sur un vrai reset (nouveau QR necessaire).
-// --------------------------------------------------------------------------
-
-const AUTH_BACKUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const AUTH_BACKUP_INTERVAL_MS = 30 * 60 * 1000;
 let authBackupInterval = null;
 let badSessionRestoreAttempted = false;
 
@@ -235,9 +212,9 @@ function backupAuthState() {
     if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
     fs.cpSync(AUTH_DIR, tmpDir, {
       recursive: true,
-      filter: (src) => !src.includes(".tmp-"), // jamais de fichier temporaire en cours d'ecriture dans le backup
+      filter: (src) => !src.includes(".tmp-"),
     });
-    // Remplacement atomique : jamais de backup a moitie ecrit si ca plante en cours de route.
+
     if (fs.existsSync(AUTH_BACKUP_DIR)) fs.rmSync(AUTH_BACKUP_DIR, { recursive: true, force: true });
     fs.renameSync(tmpDir, AUTH_BACKUP_DIR);
   } catch (e) {
@@ -260,45 +237,20 @@ function restoreAuthBackup() {
 
 function startAuthBackupSchedule() {
   if (authBackupInterval) clearInterval(authBackupInterval);
-  // Premiere sauvegarde peu apres la connexion, puis toutes les 30 minutes.
+
   setTimeout(backupAuthState, 15000);
   authBackupInterval = setInterval(backupAuthState, AUTH_BACKUP_INTERVAL_MS);
 }
 
-// --------------------------------------------------------------------------
-// PERSISTANCE DE SESSION BLINDEE (remplace useMultiFileAuthState standard)
-//
-// La cause racine la plus probable des "badSession" / "Stream Errored (ack)"
-// qu'on chasse depuis le debut : le stockage officiel de Baileys ecrit
-// chaque fichier de cle DIRECTEMENT (fs.writeFile sur le fichier final, sans
-// verrou). Sous activite normale, plusieurs cles (session/sender-key/pre-key)
-// peuvent etre mises a jour en parallele ; si deux ecritures se chevauchent
-// sur le MEME fichier, le JSON peut etre tronque/corrompu. La prochaine
-// lecture de cette cle echoue silencieusement -> erreur de dechiffrement
-// Signal ("Bad MAC") -> WhatsApp ferme le flux avec badSession -> QR requis.
-//
-// Cette version corrige les deux angles d'attaque :
-//   1) Ecriture atomique : on ecrit sur un fichier temporaire puis on
-//      renomme (rename() est atomique sur un meme systeme de fichiers) ->
-//      le fichier final n'est JAMAIS a moitie ecrit, meme si le process est
-//      tue en plein milieu.
-//   2) File d'attente par chemin : deux ecritures concurrentes sur le meme
-//      fichier sont serialisees au lieu de s'executer en parallele -> plus
-//      aucune possibilite d'interleaving.
-// Le format sur disque (noms de fichiers, serialisation BufferJSON) reste
-// identique a l'implementation officielle : compatible avec la session
-// existante, aucune migration necessaire.
-// --------------------------------------------------------------------------
-
-const fileWriteQueues = new Map(); // chemin -> Promise (chaine des ecritures en attente sur ce fichier)
+const fileWriteQueues = new Map();
 
 function queueFileWrite(filePath, task) {
   const previous = fileWriteQueues.get(filePath) || Promise.resolve();
-  const next = previous.then(task, task); // on enchaine meme si la precedente a echoue
+  const next = previous.then(task, task);
   fileWriteQueues.set(filePath, next);
-  // Une fois cette ecriture terminee, si c'est toujours la derniere en file
-  // pour ce chemin, on libere l'entree (evite une fuite memoire lente sur
-  // une session qui tourne des semaines avec des milliers de cles).
+
+
+
   next.finally(() => {
     if (fileWriteQueues.get(filePath) === next) fileWriteQueues.delete(filePath);
   }).catch(() => {});
@@ -321,9 +273,6 @@ function fixAuthFileName(file) {
   return file.replace(/\//g, "__");
 }
 
-// Supprime les fichiers temporaires orphelins d'un crash precedent (process
-// tue pile entre l'ecriture du .tmp et le rename). Purement cosmetique/hygiene,
-// aucun risque puisqu'un .tmp orphelin n'est jamais lu par personne.
 function cleanupOrphanAuthTmpFiles(folder) {
   try {
     if (!fs.existsSync(folder)) return;
@@ -403,10 +352,10 @@ async function useHardenedMultiFileAuthState(folder) {
   };
 }
 
-let waRestartInProgress   = false; // true tant qu'un cycle reconnexion est en cours
-let reconnectAttempts     = 0;     // pour le backoff exponentiel
-let reconnectTimer        = null;  // handle du setTimeout actif, pour pouvoir l'annuler
-let discordNotifiedThisCycle = false; // evite de spammer le salon a chaque tentative
+let waRestartInProgress   = false;
+let reconnectAttempts     = 0;
+let reconnectTimer        = null;
+let discordNotifiedThisCycle = false;
 
 const RECONNECT_BASE_DELAY_MS = 3000;
 const RECONNECT_MAX_DELAY_MS  = 60000;
@@ -425,10 +374,6 @@ function computeBackoffDelay() {
   return capped + jitter;
 }
 
-// Reessaie une action reseau (Discord, etc.) en cas d'erreur transitoire
-// (timeout de connexion, DNS, reset...). Les blips reseau de quelques
-// secondes (frequents la nuit sur certains VPS) ne doivent pas faire
-// echouer definitivement un envoi important comme le QR code.
 async function withRetry(fn, { attempts = 3, delayMs = 4000 } = {}) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -456,8 +401,6 @@ async function notifyDiscordOnce(text) {
   } catch (_) {}
 }
 
-// Point d'entree UNIQUE pour reprogrammer une reconnexion. Appele uniquement
-// depuis le handler "close" de connection.update.
 function scheduleReconnect(reason, { immediate = false, clearSession = false } = {}) {
   clearPendingReconnect();
   waRestartInProgress = true;
@@ -467,8 +410,8 @@ function scheduleReconnect(reason, { immediate = false, clearSession = false } =
   if (clearSession) {
     try {
       fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      // La sauvegarde correspond a la meme session invalidee : inutile de la
-      // garder, elle ne ferait que redonner un badSession au prochain restore.
+
+
       fs.rmSync(AUTH_BACKUP_DIR, { recursive: true, force: true });
     } catch (e) {
       logError("Erreur suppression session pendant reconnexion", e);
@@ -488,15 +431,13 @@ function scheduleReconnect(reason, { immediate = false, clearSession = false } =
     startWaSocket().catch((e) => {
       logError("Erreur reinitialisation du client WA", e);
       waRestartInProgress = false;
-      // Un echec au demarrage ne declenche PAS connection.update("close"),
-      // donc on doit reprogrammer nous-memes ici pour ne pas rester bloque.
+
+
       scheduleReconnect(`echec startWaSocket: ${e.message}`);
     });
   }, delay);
 }
 
-// Demande la fin du socket actuel. Ne relance JAMAIS startWaSocket()
-// directement : ca reste le role du handler "close".
 function requestWaSocketEnd(reason) {
   if (waRestartInProgress) {
     console.log(`Fin de socket ignoree (reconnexion deja en cours) : ${reason}`);
@@ -507,7 +448,7 @@ function requestWaSocketEnd(reason) {
     if (sock) {
       sock.end(new Error(reason));
     } else {
-      // Aucun socket actif (ex: erreur pendant l'init) : on programme nous-memes.
+
       scheduleReconnect(reason);
     }
   } catch (e) {
@@ -525,7 +466,7 @@ async function forceQrResend() {
   waRestartInProgress = true;
   waReady = false;
   reconnectAttempts = 0;
-  discordNotifiedThisCycle = true; // on ne veut pas du message "probleme detecte" ici
+  discordNotifiedThisCycle = true;
   invalidateGroupCache();
   console.log("Regeneration manuelle du QR code demandee (/qr ou !qr).");
 
@@ -670,9 +611,6 @@ async function getCachedGuildMembers() {
   return guild;
 }
 
-// Recherche un membre humain (jamais un bot, jamais le bridge lui-meme) par pseudo/surnom.
-// Priorise toujours un match EXACT avant un match "flou", pour eviter de pinguer la
-// mauvaise personne (ou le bot du pont) a cause d'une simple sous-chaine en commun.
 function findGuildMemberByName(guild, name) {
   if (!guild || !name) return null;
   const nameLower = String(name).toLowerCase().trim();
@@ -700,7 +638,7 @@ function findGuildMemberByName(guild, name) {
 // CACHE : GROUPE WHATSAPP SELECTIONNE (Baileys : groupMetadata)
 // ==========================================================================
 
-const groupMetadataCache = new Map(); // jid -> { metadata, at }
+const groupMetadataCache = new Map();
 
 function invalidateGroupCache() {
   groupMetadataCache.clear();
@@ -891,7 +829,7 @@ function getQuotedInfo(msg) {
 }
 
 const POLL_CREATION_TYPES = ["pollCreationMessage", "pollCreationMessageV2", "pollCreationMessageV3"];
-const DISCORD_POLL_MAX_ANSWERS = 10; // limite imposee par l'API Discord
+const DISCORD_POLL_MAX_ANSWERS = 10;
 
 function getWaMessageKind(msg) {
   const type = getMessageContentType(msg);
@@ -950,16 +888,9 @@ function getSenderJid(msg) {
   return msg.key.participant || msg.key.remoteJid;
 }
 
-// Cache leger : un seul membre Discord a la fois (pas tout le serveur), avec
-// son propre TTL par entree. Beaucoup plus economique qu'un guild.members.fetch()
-// complet appele a chaque message WhatsApp relaye.
-const linkedMemberCache = new Map(); // discordId -> { name, at }
-const LINKED_MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const linkedMemberCache = new Map();
+const LINKED_MEMBER_CACHE_TTL = 5 * 60 * 1000;
 
-// Si le numero WA est lie a un compte Discord (via !link), on retourne le nom
-// affiche cote Discord (surnom serveur en priorite, sinon pseudo Discord, sinon
-// le nom stocke au moment du lien). Ca permet d'afficher "comme sur Discord"
-// meme si le contact a ete renomme cote WhatsApp.
 async function getLinkedDiscordDisplayName(number) {
   if (!number) return null;
   const link = findLinkByWaNumber(number);
@@ -973,8 +904,8 @@ async function getLinkedDiscordDisplayName(number) {
   try {
     const guild = discordClient.guilds.cache.first();
     if (guild) {
-      // On ne recupere QUE ce membre precis (un seul appel API leger), jamais
-      // tout le serveur : appele a chaque message WA, ca doit rester bon marche.
+
+
       let member = guild.members.cache.get(link.discordId);
       if (!member) {
         member = await guild.members.fetch(link.discordId).catch(() => null);
@@ -1010,16 +941,16 @@ async function getSenderName(msg) {
   const jid = getSenderJid(msg);
   const number = jid ? jid.split("@")[0] : "Inconnu";
 
-  // Priorite absolue : si la personne a lie son compte Discord (!link), on
-  // affiche son nom Discord (surnom serveur / pseudo), pour que ca corresponde
-  // a "comme la personne se nomme sur Discord" meme si elle a ete renommee
-  // dans le repertoire WhatsApp de Pkai.
+
+
+
+
   const linkedName = await getLinkedDiscordDisplayName(number);
   if (linkedName) return linkedName;
 
-  // Sinon, priorite au nom que Pkai a donne au contact dans son repertoire.
-  // Sinon, on retombe sur le pseudo WhatsApp de la personne (pushName du
-  // message en priorite car toujours a jour, sinon celui mis en cache).
+
+
+
   return (
     contactSavedNameCache.get(jid) ||
     msg.pushName ||
@@ -1218,7 +1149,7 @@ async function handleTxtCommandWa(msg) {
       return;
     }
 
-    // On reconstruit un WAMessage minimal pour pouvoir telecharger le media cite.
+
     const quotedFakeMsg = {
       key: {
         remoteJid: msg.key.remoteJid,
@@ -1304,6 +1235,108 @@ async function handleTxtCommand(msg, source) {
 // SLASH COMMANDS : DEFINITION ET ENREGISTREMENT
 // ==========================================================================
 
+// ==========================================================================
+// MISE A JOUR GITHUB AUTOMATIQUE (verif au demarrage + bouton Oui/Non)
+// ==========================================================================
+
+function isGitRepo() {
+  return fs.existsSync(`${__dirname}/.git`);
+}
+
+function getCurrentBranch() {
+  return execSync("git rev-parse --abbrev-ref HEAD", { cwd: __dirname }).toString().trim();
+}
+
+function getLocalCommitHash() {
+  return execSync("git rev-parse HEAD", { cwd: __dirname }).toString().trim();
+}
+
+function getRemoteCommitHash(branch) {
+  execSync("git fetch origin --quiet", { cwd: __dirname, timeout: 20000 });
+  return execSync(`git rev-parse origin/${branch}`, { cwd: __dirname }).toString().trim();
+}
+
+function getUpdateCommitLog(branch) {
+  try {
+    return execSync(`git log HEAD..origin/${branch} --oneline --max-count=10`, { cwd: __dirname })
+      .toString()
+      .trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+function loadUpdateState() {
+  try {
+    return JSON.parse(fs.readFileSync(UPDATE_STATE_FILE, "utf8"));
+  } catch (_) {
+    return { lastPromptedCommit: null };
+  }
+}
+
+function saveUpdateState(state) {
+  try {
+    fs.writeFileSync(UPDATE_STATE_FILE, JSON.stringify(state));
+  } catch (e) {
+    logError("Erreur sauvegarde etat mise a jour", e);
+  }
+}
+
+async function checkForGitHubUpdate({ force = false } = {}) {
+  if (!isGitRepo()) return { available: false, reason: "pas un depot git" };
+
+  try {
+    const branch = getCurrentBranch();
+    const local  = getLocalCommitHash();
+    const remote = getRemoteCommitHash(branch);
+
+    if (local === remote) return { available: false };
+
+    const state = loadUpdateState();
+    if (!force && state.lastPromptedCommit === remote) {
+      return { available: true, alreadyPrompted: true, remote, branch };
+    }
+
+    const log = getUpdateCommitLog(branch);
+    return { available: true, alreadyPrompted: false, remote, local, branch, log };
+  } catch (e) {
+    logError("Erreur verification mise a jour GitHub", e);
+    return { available: false, error: e.message };
+  }
+}
+
+async function promptGitHubUpdate(update) {
+  try {
+    const channel = await getDiscordChannel();
+    const commitList = update.log ? `\n\`\`\`\n${update.log}\n\`\`\`` : "";
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("update_yes").setLabel("Oui, installer").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("update_no").setLabel("Non, plus tard").setStyle(ButtonStyle.Secondary)
+    );
+    await channel.send({
+      content: `Nouvelle mise a jour disponible sur GitHub (branche \`${update.branch}\`) :${commitList}\nVoulez-vous l'installer maintenant ? Le bot redemarrera automatiquement apres.`,
+      components: [row],
+    });
+    saveUpdateState({ lastPromptedCommit: update.remote });
+  } catch (e) {
+    logError("Erreur envoi proposition de mise a jour", e);
+  }
+}
+
+function performGitUpdate(branch) {
+  const cwd = __dirname;
+  execSync(`git pull --ff-only origin ${branch}`, { cwd, timeout: 30000 });
+
+  let changedFiles = "";
+  try {
+    changedFiles = execSync("git diff --name-only ORIG_HEAD HEAD", { cwd }).toString();
+  } catch (_) {}
+
+  if (/package(-lock)?\.json/.test(changedFiles)) {
+    execSync("npm install --production", { cwd, timeout: 120000 });
+  }
+}
+
 const commands = [
   new SlashCommandBuilder().setName("ping").setDescription("Verifie la latence du bot"),
   new SlashCommandBuilder().setName("status").setDescription("Etat de la connexion WhatsApp et du groupe selectionne"),
@@ -1323,6 +1356,7 @@ const commands = [
     .setDescription("Lie ton pseudo Discord et ton numero WhatsApp (sert a la sync des mentions @)")
     .addStringOption((opt) => opt.setName("pseudo").setDescription("Ton nom d'utilisateur Discord").setRequired(true))
     .addStringOption((opt) => opt.setName("numero").setDescription("Ton numero WhatsApp (ex: 33612345678)").setRequired(true)),
+  new SlashCommandBuilder().setName("update").setDescription("Verifie s'il y a une mise a jour disponible sur GitHub"),
 ].map((cmd) => cmd.toJSON());
 
 async function registerSlashCommands() {
@@ -1343,6 +1377,13 @@ async function registerSlashCommands() {
 discordClient.once("clientReady", async () => {
   console.log(`Discord connecte : ${discordClient.user.tag}`);
   await registerSlashCommands();
+
+  const update = await checkForGitHubUpdate();
+  if (update.available && !update.alreadyPrompted) {
+    await promptGitHubUpdate(update);
+  } else if (update.available && update.alreadyPrompted) {
+    console.log("Mise a jour GitHub deja proposee pour ce commit, pas de re-notification.");
+  }
 });
 
 // ==========================================================================
@@ -1357,7 +1398,8 @@ const HELP_TEXT_SLASH =
   "`/status` - Etat de la connexion\n" +
   "`/qr` - Force la regeneration et l'envoi du QR code de connexion WhatsApp\n" +
   "`/connexion <numero>` - Connecte WhatsApp sans QR : recois un code de couplage en MP\n" +
-  "`/link <pseudo> <numero>` - Lie ton pseudo Discord a ton numero WhatsApp (sync des @)\n" +
+  "`/link <pseudo> <numero>` - Lie ton pseudo Discord et ton numero WhatsApp (sync des @)\n" +
+  "`/update` - Verifie s'il y a une mise a jour GitHub disponible\n" +
   "`/help` - Cette aide\n\n" +
   "**Commandes `!` (Discord & WA) :**\n" +
   "`!txt` - Transcrit un message vocal (reply sur le vocal)\n" +
@@ -1368,6 +1410,43 @@ const HELP_TEXT_SLASH =
   "et un sondage WhatsApp est relaye sur Discord sous forme de message (question + options).";
 
 discordClient.on("interactionCreate", async (interaction) => {
+  if (interaction.isButton()) {
+    if (interaction.customId === "update_yes") {
+      try {
+        await interaction.update({ content: "Installation de la mise a jour en cours...", components: [] });
+        const branch = getCurrentBranch();
+        performGitUpdate(branch);
+        await interaction.channel.send(
+          "Mise a jour installee avec succes. Redemarrage du bot dans quelques secondes..."
+        );
+        console.log("Mise a jour GitHub installee, redemarrage du process...");
+        clearPendingReconnect();
+        if (authBackupInterval) clearInterval(authBackupInterval);
+        try { if (sock) sock.end(undefined); } catch (_) {}
+        releaseSingleInstanceLock();
+
+        setTimeout(() => process.exit(0), 1500);
+      } catch (e) {
+        logError("Erreur installation mise a jour GitHub", e);
+        try {
+          await interaction.channel.send(
+            `Echec de la mise a jour : ${e.message}\nLe bot continue de tourner avec la version actuelle, rien n'a ete casse.`
+          );
+        } catch (_) {}
+      }
+      return;
+    }
+
+    if (interaction.customId === "update_no") {
+      try {
+        await interaction.update({ content: "Mise a jour ignoree pour le moment (tu peux relancer `/update` plus tard).", components: [] });
+      } catch (_) {}
+      return;
+    }
+
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.channelId !== DISCORD_CHANNEL_ID) {
@@ -1397,6 +1476,19 @@ discordClient.on("interactionCreate", async (interaction) => {
 
   if (commandName === "help") {
     await safeReply(HELP_TEXT_SLASH);
+    return;
+  }
+
+  if (commandName === "update") {
+    await safeReply("Verification des mises a jour GitHub...");
+    const update = await checkForGitHubUpdate({ force: true });
+    if (update.error) {
+      await interaction.channel.send(`Impossible de verifier les mises a jour : ${update.error}`);
+    } else if (!update.available) {
+      await interaction.channel.send("Le bot est deja a jour, rien a installer.");
+    } else {
+      await promptGitHubUpdate(update);
+    }
     return;
   }
 
@@ -1577,14 +1669,14 @@ async function startWaSocket() {
     syncFullHistory: false,
     markOnlineOnConnect: false,
     msgRetryCounterCache: new NodeCache(),
-    // Laisse Baileys gerer lui-meme son ping/pong interne (keepalive) ;
-    // on ne le desactive/modifie pas, c'est ce qui permet de detecter
-    // une connexion morte plus vite qu'un timeout TCP classique.
+
+
+
   });
 
-  // On fige la reference : si un autre socket est cree entre-temps (ne devrait
-  // plus arriver avec le point d'entree unique, mais on se protege quand meme
-  // contre des events tardifs d'un ancien socket), on ignore les events perimes.
+
+
+
   sock = newSock;
 
   newSock.ev.on("creds.update", saveCreds);
@@ -1599,15 +1691,15 @@ async function startWaSocket() {
   newSock.ev.on("contacts.update", (contacts) => {
     for (const c of contacts) {
       if (!c.id) continue;
-      // Une mise a jour partielle (ex: juste le notify qui change) ne doit
-      // jamais effacer le nom que Pkai a donne au contact.
+
+
       if (c.name) contactSavedNameCache.set(c.id, c.name);
       if (c.notify) contactNotifyNameCache.set(c.id, c.notify);
     }
   });
 
   newSock.ev.on("connection.update", async (update) => {
-    if (sock !== newSock) return; // event d'un socket perime, on ignore
+    if (sock !== newSock) return;
     try {
       const { connection, lastDisconnect, qr } = update;
 
@@ -1626,9 +1718,9 @@ async function startWaSocket() {
           console.log("QR code envoye sur Discord.");
         } catch (e) {
           logError("Erreur QR (echec apres plusieurs tentatives)", e);
-          // Baileys va rafraichir le QR et re-emettre un nouvel event "qr" sous
-          // peu : on ne bloque pas, la prochaine tentative pourra reussir si le
-          // reseau redevient stable entre-temps.
+
+
+
         }
       }
 
@@ -1641,7 +1733,7 @@ async function startWaSocket() {
         badSessionRestoreAttempted = false;
         startAuthBackupSchedule();
         await new Promise((r) => setTimeout(r, 5000));
-        if (sock !== newSock) return; // reconnecte entre-temps, on abandonne
+        if (sock !== newSock) return;
         startTimestamp = Math.floor(Date.now() / 1000);
         waReady = true;
         console.log("WhatsApp pret");
@@ -1662,23 +1754,23 @@ async function startWaSocket() {
           statusCode === DisconnectReason.badSession ||
           statusCode === DisconnectReason.multideviceMismatch;
 
-        // restartRequired arrive normalement juste apres un scan de QR / pairing :
-        // c'est un evenement attendu, pas une panne. On reconnecte tout de suite
-        // sans spammer le salon Discord ni toucher au backoff.
+
+
+
         const isBenignRestart = statusCode === DisconnectReason.restartRequired;
 
-        // connectionReplaced = un autre socket s'est connecte avec la meme
-        // session (double instance du bot, ou ancien process PM2 pas kille).
-        // Reconnecter en boucle serree ne ferait que se battre avec l'autre
-        // connexion : on garde un backoff plus large ici.
+
+
+
+
         const isConflict = statusCode === DisconnectReason.connectionReplaced;
 
         if (needsFreshSession) {
-          // badSession = cles locales corrompues, mais la session cote serveur
-          // WhatsApp est peut-etre toujours valide. On tente UNE restauration
-          // depuis la derniere sauvegarde connue-bonne avant d'abandonner et
-          // de forcer un nouveau QR (loggedOut/multideviceMismatch = WhatsApp
-          // a explicitement invalide la session, une restauration ne sert a rien).
+
+
+
+
+
           if (
             statusCode === DisconnectReason.badSession &&
             !badSessionRestoreAttempted &&
@@ -1711,17 +1803,17 @@ async function startWaSocket() {
             `WhatsApp signale qu'une autre connexion a pris le relais (code ${statusCode}). ` +
             "Verifie qu'il n'y a pas deux instances du bot qui tournent (ex: doublon PM2). Nouvelle tentative dans quelques instants..."
           ).catch(() => {});
-          // On force un delai minimum plus long que le backoff de base pour laisser
-          // le temps a l'eventuelle autre instance de se stabiliser ou de crasher.
+
+
           reconnectAttempts = Math.max(reconnectAttempts, 2);
           scheduleReconnect(`connectionReplaced: ${errMsg}`);
           return;
         }
 
-        // Un premier accroc transitoire (reseau, ack, etc.) se repare presque
-        // toujours tout seul en quelques secondes : pas besoin d'alarmer sur
-        // Discord pour ca. On ne notifie que si ca persiste (ce close arrive
-        // alors qu'on est deja en train de reessayer depuis un moment).
+
+
+
+
         if (reconnectAttempts > 0) {
           notifyDiscordOnce("Le pont WhatsApp a rencontre un probleme et se reconnecte automatiquement...").catch(() => {});
         } else {
@@ -1730,10 +1822,10 @@ async function startWaSocket() {
         scheduleReconnect(`${statusCode || "close"}: ${errMsg}`);
       }
     } catch (e) {
-      // Filet de securite absolu : quoi qu'il arrive, si le traitement de
-      // connection.update plante, on ne doit JAMAIS rester sans reconnexion
-      // programmee (sinon le pont reste "mort" en silence tant qu'un humain
-      // ne redemarre pas PM2 - ce qui ressemble a un crash de l'exterieur).
+
+
+
+
       logError("Erreur interne dans connection.update", e);
       if (!reconnectTimer) {
         scheduleReconnect(`erreur interne connection.update: ${e.message}`);
@@ -1949,16 +2041,16 @@ async function relayWaPollToDiscord(msg, name, waId) {
   log("WA->DC", name, `[SONDAGE] ${data.question}`);
 
   try {
-    // Un sondage natif Discord ne peut pas etre cree via un webhook (l'API
-    // ne le supporte pas), donc on passe par le bot lui-meme. Le nom de
-    // l'auteur WA est mis dans le message qui accompagne le sondage.
+
+
+
     const channel = await getDiscordChannel();
     const sent = await channel.send({
       content: `**${name}** a cree un sondage WhatsApp :`,
       poll: {
         question: { text: data.question },
         answers: answers.map((text) => ({ text })),
-        duration: 168, // 7 jours
+        duration: 168,
         allowMultiselect: data.multi,
       },
     });
@@ -1966,9 +2058,9 @@ async function relayWaPollToDiscord(msg, name, waId) {
     discordToWa.set(sent.id, waId);
   } catch (e) {
     logError("Erreur creation sondage Discord depuis WA", e);
-    // Filet de secours : si la creation du vrai sondage echoue (ex: version
-    // de discord.js trop ancienne pour supporter les sondages natifs), on
-    // relaie au moins le texte du sondage pour ne rien perdre.
+
+
+
     try {
       const fallbackText = formatWaPoll(msg) || "Sondage WhatsApp";
       const webhookOptions = { username: name, content: fallbackText };
