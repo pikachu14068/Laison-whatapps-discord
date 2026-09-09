@@ -98,6 +98,63 @@ class BoundedMap extends Map {
 }
 
 // ==========================================================================
+// FILE D'ENVOI SERIALISEE : EVITE LES ENVOIS CONCURRENTS ET LES PERTES
+// ==========================================================================
+class SerialQueue {
+  constructor(name, maxPending = 500) {
+    this.name = name;
+    this.maxPending = maxPending;
+    this.queue = [];
+    this.running = false;
+  }
+
+  get size() {
+    return this.queue.length + (this.running ? 1 : 0);
+  }
+
+  add(task, label = "job") {
+    return new Promise((resolve, reject) => {
+      if (this.queue.length >= this.maxPending) {
+        const dropped = this.queue.shift();
+        if (dropped) {
+          dropped.reject(new Error(`File ${this.name} pleine`));
+          console.error(`File ${this.name} pleine : ancienne tache supprimee`);
+        }
+      }
+
+      this.queue.push({ task, label, resolve, reject });
+      this.run().catch((e) => logError(`Erreur worker ${this.name}`, e));
+    });
+  }
+
+  async run() {
+    if (this.running) return;
+    this.running = true;
+
+    try {
+      while (this.queue.length) {
+        const job = this.queue.shift();
+        if (!job) continue;
+
+        try {
+          const result = await job.task();
+          job.resolve(result);
+        } catch (e) {
+          job.reject(e);
+          logError(`Tache ${this.name}/${job.label} echouee`, e);
+        }
+      }
+    } finally {
+      this.running = false;
+      if (this.queue.length) this.run().catch((e) => logError(`Erreur relance worker ${this.name}`, e));
+    }
+  }
+}
+
+const waSendQueue = new SerialQueue("WA_SEND", 300);
+const waToDiscordQueue = new SerialQueue("WA_TO_DC", 300);
+
+// ==========================================================================
 // INIT CLIENTS
 // ==========================================================================
 
@@ -428,6 +485,14 @@ function scheduleReconnect(reason, { immediate = false, clearSession = false } =
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
+
+    const oldSock = sock;
+    if (oldSock) {
+      try { oldSock.ev.removeAllListeners(); } catch (_) {}
+      try { oldSock.end(undefined); } catch (_) {}
+      if (sock === oldSock) sock = null;
+    }
+
     startWaSocket().catch((e) => {
       logError("Erreur reinitialisation du client WA", e);
       waRestartInProgress = false;
@@ -662,35 +727,112 @@ function isTransientSessionError(e) {
   );
 }
 
-async function sendWaMessage(jid, content, options = {}) {
-  const payload = typeof content === "string" ? { text: content } : { ...content };
-  if (options.mentions && options.mentions.length) payload.mentions = options.mentions;
+async function waitForWaReady(timeoutMs = 90000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!waReady || !sock) {
+    if (Date.now() >= deadline) {
+      throw new Error("WhatsApp non pret apres attente");
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
 
+function isRetryableWaSendError(e) {
+  const msg = String((e && e.message) || e || "").toLowerCase();
+  return (
+    isTransientSessionError(e) ||
+    msg.includes("connection closed") ||
+    msg.includes("stream errored") ||
+    msg.includes("timed out") ||
+    msg.includes("socket closed") ||
+    msg.includes("not connected") ||
+    msg.includes("connection reset") ||
+    msg.includes("econnreset") ||
+    msg.includes("etimedout") ||
+    msg.includes("network")
+  );
+}
+
+async function sendWaMessageNow(jid, payload, options = {}) {
   const sendOptions = {};
   if (options.quotedMessageId) {
     const quotedMsg = waMessageStore.get(options.quotedMessageId);
     if (quotedMsg) sendOptions.quoted = quotedMsg;
   }
 
-  try {
-    const sent = await sock.sendMessage(jid, payload, sendOptions);
-    if (sent) rememberWaMessage(sent);
-    return sent;
-  } catch (e) {
-    if (!isTransientSessionError(e)) throw e;
-    for (const delayMs of [15000, 20000]) {
-      console.warn(`Session pas encore prete pour ${jid}, nouvelle tentative dans ${delayMs / 1000}s...`);
-      await new Promise((r) => setTimeout(r, delayMs));
+  let lastError = null;
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      await waitForWaReady(90000);
+
+      const currentSock = sock;
+      if (!currentSock) throw new Error("Socket WhatsApp absent");
+
+      const sent = await currentSock.sendMessage(jid, payload, sendOptions);
+      if (sent) rememberWaMessage(sent);
+      return sent;
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableWaSendError(e)) throw e;
+
+      const delay = Math.min(3000 * Math.pow(2, attempt - 1), 30000) + Math.floor(Math.random() * 1000);
+      console.warn(`Envoi WA interne echoue (${attempt}/8) : ${e.message}. Nouvelle tentative dans ${Math.round(delay / 1000)}s`);
+
+      if (!waReady && !reconnectTimer && !waRestartInProgress) {
+        scheduleReconnect(`echec envoi interne: ${e.message}`);
+      }
+
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+
+  throw lastError || new Error("Envoi WhatsApp impossible");
+}
+
+async function sendWaMessage(jid, content, options = {}) {
+  const payload = typeof content === "string" ? { text: content } : { ...content };
+  if (options.mentions && options.mentions.length) payload.mentions = options.mentions;
+
+  const quotedMessageId = options.quotedMessageId || null;
+  const label = `${jid}:${String(payload.text || payload.caption || "media").slice(0, 40)}`;
+
+  return waSendQueue.add(async () => {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= 8; attempt++) {
       try {
-        const sent = await sock.sendMessage(jid, payload, sendOptions);
+        await waitForWaReady(90000);
+
+        const sendOptions = {};
+        if (quotedMessageId) {
+          const quotedMsg = waMessageStore.get(quotedMessageId);
+          if (quotedMsg) sendOptions.quoted = quotedMsg;
+        }
+
+        const currentSock = sock;
+        if (!currentSock) throw new Error("Socket WhatsApp absent");
+
+        const sent = await currentSock.sendMessage(jid, payload, sendOptions);
         if (sent) rememberWaMessage(sent);
         return sent;
-      } catch (e2) {
-        if (!isTransientSessionError(e2)) throw e2;
+      } catch (e) {
+        lastError = e;
+
+        if (!isRetryableWaSendError(e)) throw e;
+
+        const delay = Math.min(3000 * Math.pow(2, attempt - 1), 30000) + Math.floor(Math.random() * 1000);
+        console.warn(`Envoi WA echoue (${attempt}/8) pour ${label}: ${e.message}. Nouvelle tentative dans ${Math.round(delay / 1000)}s`);
+
+        if (!waReady && !reconnectTimer && !waRestartInProgress) {
+          scheduleReconnect(`echec envoi: ${e.message}`);
+        }
+
+        await new Promise((r) => setTimeout(r, delay));
       }
     }
-    throw e;
-  }
+
+    throw lastError || new Error("Envoi WhatsApp impossible");
+  }, label);
 }
 
 async function getSelectedGroup() {
@@ -941,15 +1083,8 @@ async function getSenderName(msg) {
   const jid = getSenderJid(msg);
   const number = jid ? jid.split("@")[0] : "Inconnu";
 
-
-
-
-
   const linkedName = await getLinkedDiscordDisplayName(number);
   if (linkedName) return linkedName;
-
-
-
 
   return (
     contactSavedNameCache.get(jid) ||
@@ -1001,6 +1136,52 @@ async function buildReplyPrefix(quotedDiscordId) {
   } catch (_) {
     return "";
   }
+}
+
+// ==========================================================================
+// ENVOIS DISCORD ROBUSTES
+// ==========================================================================
+async function sendDiscordWebhook(payload) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      return await webhook.send(payload);
+    } catch (e) {
+      lastError = e;
+      const delay = Math.min(2000 * Math.pow(2, attempt - 1), 15000) + Math.floor(Math.random() * 500);
+      console.warn(`Envoi Discord echoue (${attempt}/5): ${e.message}`);
+      if (attempt < 5) await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastError || new Error("Envoi Discord impossible");
+}
+
+async function editDiscordWebhook(id, payload) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      return await webhook.editMessage(id, payload);
+    } catch (e) {
+      lastError = e;
+      if (String(e.message || "").includes("Unknown Message")) throw e;
+      if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(2000 * Math.pow(2, attempt - 1), 15000)));
+    }
+  }
+  throw lastError || new Error("Edition Discord impossible");
+}
+
+async function deleteDiscordWebhook(id) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      return await webhook.deleteMessage(id);
+    } catch (e) {
+      lastError = e;
+      if (String(e.message || "").includes("Unknown Message")) throw e;
+      if (attempt < 5) await new Promise((r) => setTimeout(r, Math.min(2000 * Math.pow(2, attempt - 1), 15000)));
+    }
+  }
+  throw lastError || new Error("Suppression Discord impossible");
 }
 
 // ==========================================================================
@@ -1652,6 +1833,11 @@ discordClient.on("interactionCreate", async (interaction) => {
 // ==========================================================================
 
 async function startWaSocket() {
+  if (sock && waRestartInProgress) {
+    console.log("Demarrage WA ignore : un demarrage est deja en cours.");
+    return sock;
+  }
+
   clearPendingReconnect();
   waRestartInProgress = true;
 
@@ -1668,14 +1854,24 @@ async function startWaSocket() {
     browser: Browsers.ubuntu("Chrome"),
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    msgRetryCounterCache: new NodeCache(),
+
+    // Reglages de stabilite reseau
+    connectTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
+    defaultQueryTimeoutMs: 60000,
+    retryRequestDelayMs: 3000,
+    maxMsgRetryCount: 5,
+    fireInitQueries: true,
+
+    msgRetryCounterCache: new NodeCache({
+      stdTTL: 10 * 60,
+      checkperiod: 60,
+      useClones: false,
+    }),
 
 
 
   });
-
-
-
 
   sock = newSock;
 
@@ -1754,22 +1950,11 @@ async function startWaSocket() {
           statusCode === DisconnectReason.badSession ||
           statusCode === DisconnectReason.multideviceMismatch;
 
-
-
-
         const isBenignRestart = statusCode === DisconnectReason.restartRequired;
-
-
-
-
 
         const isConflict = statusCode === DisconnectReason.connectionReplaced;
 
         if (needsFreshSession) {
-
-
-
-
 
           if (
             statusCode === DisconnectReason.badSession &&
@@ -1810,10 +1995,6 @@ async function startWaSocket() {
           return;
         }
 
-
-
-
-
         if (reconnectAttempts > 0) {
           notifyDiscordOnce("Le pont WhatsApp a rencontre un probleme et se reconnecte automatiquement...").catch(() => {});
         } else {
@@ -1823,9 +2004,6 @@ async function startWaSocket() {
       }
     } catch (e) {
 
-
-
-
       logError("Erreur interne dans connection.update", e);
       if (!reconnectTimer) {
         scheduleReconnect(`erreur interne connection.update: ${e.message}`);
@@ -1833,15 +2011,15 @@ async function startWaSocket() {
     }
   });
 
-  newSock.ev.on("messages.upsert", async ({ messages, type }) => {
+  newSock.ev.on("messages.upsert", ({ messages, type }) => {
     if (sock !== newSock) return;
     if (type !== "notify") return;
+
     for (const m of messages) {
-      try {
-        await handleIncomingWaMessage(m);
-      } catch (e) {
-        logError("Erreur traitement message WA", e);
-      }
+      waToDiscordQueue.add(
+        () => handleIncomingWaMessage(m),
+        `WA message ${m && m.key ? m.key.id : "unknown"}`
+      ).catch((e) => logError("Erreur traitement message WA", e));
     }
   });
 
@@ -1932,7 +2110,7 @@ async function handleWaProtocolMessage(msg) {
     try {
       const senderJid = msg.key.participant || jid;
       const name = await getContactDisplayName(senderJid);
-      await webhook.editMessage(discordId, { content: `${name} : ${newText || "[MEDIA]"} *(edite)*` });
+      await editDiscordWebhook(discordId, { content: `${name} : ${newText || "[MEDIA]"} *(edite)*` });
     } catch (e) {
       if (!e.message.includes("Unknown Message")) logError("Erreur edition WA->DC", e);
     }
@@ -1945,7 +2123,7 @@ async function handleWaProtocolMessage(msg) {
     const discordId = waToDiscord.get(originalId);
     if (!discordId) return;
     try {
-      await webhook.deleteMessage(discordId);
+      await deleteDiscordWebhook(discordId);
     } catch (e) {
       if (!e.message.includes("Unknown Message")) logError("Erreur suppression WA->DC", e);
     }
@@ -2066,7 +2244,7 @@ async function relayWaPollToDiscord(msg, name, waId) {
       const webhookOptions = { username: name, content: fallbackText };
       const avatarUrl = await getContactAvatarUrl(getSenderJid(msg));
       if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
-      const sent = await webhook.send(webhookOptions);
+      const sent = await sendDiscordWebhook(webhookOptions);
       waToDiscord.set(waId, sent.id);
       discordToWa.set(sent.id, waId);
     } catch (e2) {
@@ -2107,7 +2285,7 @@ async function relayWaMessageToDiscord(msg, senderJid, name, rawText, waId) {
         };
         if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
 
-        const sent = await webhook.send(webhookOptions);
+        const sent = await sendDiscordWebhook(webhookOptions);
         waToDiscord.set(waId, sent.id);
         discordToWa.set(sent.id, waId);
       }
@@ -2150,7 +2328,7 @@ async function relayWaMessageToDiscord(msg, senderJid, name, rawText, waId) {
   const webhookOptions = { username: name, content: finalContent || " ", files };
   if (avatarUrl) webhookOptions.avatarURL = avatarUrl;
 
-  const sent = await webhook.send(webhookOptions);
+  const sent = await sendDiscordWebhook(webhookOptions);
   waToDiscord.set(waId, sent.id);
   discordToWa.set(sent.id, waId);
 }
@@ -2315,7 +2493,7 @@ async function relayDiscordPollToWa(message, group, name) {
     }
 
     const selectableCount = poll.allowMultiselect ? answers.length : 1;
-    const sent = await group.sendMessage({
+    const sent = await sendWaMessageNow(group.id, {
       poll: { name: `${name} : ${question}`, values: answers, selectableCount },
     }, {});
 
@@ -2358,7 +2536,7 @@ async function relayDiscordMessageToWa(message, group, name, content) {
       }
 
       const sendOptions = { ...replyOptions, ...(mentions.length ? { mentions } : {}) };
-      const sent = await group.sendMessage(`*${name}* : ${waContent}`, sendOptions);
+      const sent = await sendWaMessageNow(group.id, `*${name}* : ${waContent}`, sendOptions);
 
       if (sent) {
         sentByBridge.add(sent.key.id);
@@ -2377,7 +2555,7 @@ async function relayDiscordMessageToWa(message, group, name, content) {
   for (const att of message.attachments.values()) {
     try {
       const payload = await buildWaMediaPayload(att.url, att.name, `*${name}*`);
-      const sent    = await group.sendMessage(payload, replyOptions);
+      const sent    = await sendWaMessageNow(group.id, payload, replyOptions);
 
       if (sent) {
         sentByBridge.add(sent.key.id);
@@ -2409,7 +2587,7 @@ discordClient.on("messageUpdate", async (_, newMessage) => {
   if (!stored) return;
 
   try {
-    await sock.sendMessage(stored.key.remoteJid, { text: newMessage.content, edit: stored.key });
+    await sendWaMessage(stored.key.remoteJid, { text: newMessage.content, edit: stored.key });
   } catch (e) {
     logError("Erreur edition DC->WA", e);
   }
@@ -2425,7 +2603,7 @@ discordClient.on("messageDelete", async (message) => {
   if (!stored) return;
 
   try {
-    await sock.sendMessage(stored.key.remoteJid, { delete: stored.key });
+    await sendWaMessage(stored.key.remoteJid, { delete: stored.key });
   } catch (e) {
     logError("Erreur suppression DC->WA", e);
   }
@@ -2441,19 +2619,21 @@ discordClient.on("messageCreate", async (message) => {
   if (message.interaction || message.interactionMetadata) return;
   if (message.applicationId) return;
   if (message.channel.id !== DISCORD_CHANNEL_ID) return;
-  if (!waReady) return;
   if (message.content && message.content.startsWith("/")) return;
 
   const name    = message.member ? message.member.displayName : message.author.username;
-  const content = message.content;
+  const content = message.content || "";
 
   if (message.poll) {
-    const group = await getSelectedGroup();
-    if (!group) {
-      await message.reply("Aucun groupe selectionne. Utilise `/select <n>`.");
-      return;
-    }
-    await relayDiscordPollToWa(message, group, name);
+    waSendQueue.add(async () => {
+      await waitForWaReady(120000);
+      const group = await getSelectedGroup();
+      if (!group) throw new Error("Aucun groupe WhatsApp selectionne");
+      await relayDiscordPollToWa(message, group, name);
+    }, `DC poll ${message.id}`).catch(async (e) => {
+      logError(`Erreur file DC->WA poll ${message.id}`, e);
+      try { await message.react("⚠️"); } catch (_) {}
+    });
     return;
   }
 
@@ -2464,31 +2644,56 @@ discordClient.on("messageCreate", async (message) => {
 
   if (await handleDiscordBangCommands(message, content)) return;
 
-  const group = await getSelectedGroup();
-  if (!group) {
-    await message.reply("Aucun groupe selectionne. Utilise `/select <n>`.");
-    return;
-  }
-
-  await relayDiscordMessageToWa(message, group, name, content);
+  waSendQueue.add(async () => {
+    await waitForWaReady(120000);
+    const group = await getSelectedGroup();
+    if (!group) throw new Error("Aucun groupe WhatsApp selectionne");
+    await relayDiscordMessageToWa(message, group, name, content);
+  }, `DC message ${message.id}`).catch(async (e) => {
+    logError(`Erreur file DC->WA ${message.id}`, e);
+    try { await message.react("⚠️"); } catch (_) {}
+  });
 });
 
-// ==========================================================================
-// DEMARRAGE
-// ==========================================================================
+;
 
-acquireSingleInstanceLock();
+/* ==========================================================================
+   DEMARRAGE DU BOT
+   ========================================================================== */
 
-loadSelectedGroup();
-loadLinks();
-loadMutes();
+console.log("Demarrage du bot...");
+
+try {
+  acquireSingleInstanceLock();
+  loadSelectedGroup();
+  loadLinks();
+  loadMutes();
+
+  console.log("Configuration chargee.");
+} catch (e) {
+  console.error("Erreur chargement configuration :", e);
+}
 
 discordClient.login(DISCORD_TOKEN)
-  .then(() => console.log("Connexion Discord lancee"))
-  .catch((e) => logError("Erreur connexion Discord", e));
+  .then(() => {
+    console.log("Connexion Discord lancee");
+  })
+  .catch((e) => {
+    console.error("Erreur connexion Discord :", e);
+    try {
+      logError("Erreur connexion Discord", e);
+    } catch (_) {}
+  });
 
 startWaSocket().catch((e) => {
-  logError("Erreur initialisation WA", e);
-  waRestartInProgress = false;
-  scheduleReconnect(`echec demarrage initial: ${e.message}`);
+  console.error("Erreur initialisation WhatsApp :", e);
+
+  try {
+    logError("Erreur initialisation WA", e);
+  } catch (_) {}
+
+  try {
+    waRestartInProgress = false;
+    scheduleReconnect(`echec demarrage initial: ${e.message}`);
+  } catch (_) {}
 });
