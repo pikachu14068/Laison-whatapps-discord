@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const fs       = require("fs");
+const readline = require("readline");
 const qrcode   = require("qrcode");
 const fetch    = require("node-fetch");
 const FormData = require("form-data");
@@ -172,6 +173,14 @@ const discordClient = new Client({
 });
 
 let sock = null;
+
+// Sans ces listeners, un evenement "error"/"shardError" du client Discord (coupure
+// websocket, probleme reseau, etc.) peut faire planter tout le process Node.
+discordClient.on("error", (e) => logError("Erreur client Discord (websocket)", e));
+discordClient.on("shardError", (e) => logError("Erreur shard Discord", e));
+discordClient.on("shardDisconnect", (event, id) => console.warn(`Shard Discord ${id} deconnecte (code ${event && event.code})`));
+discordClient.on("shardReconnecting", (id) => console.warn(`Shard Discord ${id} en cours de reconnexion...`));
+discordClient.on("warn", (w) => console.warn("Avertissement Discord :", w));
 
 // ==========================================================================
 // ETAT GLOBAL
@@ -754,6 +763,12 @@ function isRetryableWaSendError(e) {
 }
 
 async function sendWaMessageNow(jid, payload, options = {}) {
+  // Filet de securite : accepte aussi une chaine brute au cas ou un appelant l'oublierait,
+  // et fusionne les mentions dans le payload (Baileys les attend la, pas dans les options
+  // d'envoi) - sans ca les pings @mention / @everyone partis de Discord etaient silencieusement perdus.
+  const normalizedPayload = typeof payload === "string" ? { text: payload } : { ...payload };
+  if (options.mentions && options.mentions.length) normalizedPayload.mentions = options.mentions;
+
   const sendOptions = {};
   if (options.quotedMessageId) {
     const quotedMsg = waMessageStore.get(options.quotedMessageId);
@@ -768,7 +783,7 @@ async function sendWaMessageNow(jid, payload, options = {}) {
       const currentSock = sock;
       if (!currentSock) throw new Error("Socket WhatsApp absent");
 
-      const sent = await currentSock.sendMessage(jid, payload, sendOptions);
+      const sent = await currentSock.sendMessage(jid, normalizedPayload, sendOptions);
       if (sent) rememberWaMessage(sent);
       return sent;
     } catch (e) {
@@ -1069,27 +1084,32 @@ async function getContactDisplayName(jid) {
   if (!jid) return "Inconnu";
   const number = jid.split("@")[0];
 
+  // Priorite : nom enregistre dans le carnet d'adresses WhatsApp (renomme = source de verite),
+  // puis le pseudo Discord lie (utile seulement si le contact n'a pas de nom WA), puis le reste.
+  const savedName = contactSavedNameCache.get(jid);
+  if (savedName) return savedName;
+
   const linkedName = await getLinkedDiscordDisplayName(number);
   if (linkedName) return linkedName;
 
-  return (
-    contactSavedNameCache.get(jid) ||
-    contactNotifyNameCache.get(jid) ||
-    number
-  );
+  return contactNotifyNameCache.get(jid) || number;
 }
 
 async function getSenderName(msg) {
   const jid = getSenderJid(msg);
   const number = jid ? jid.split("@")[0] : "Inconnu";
 
+  // Meme priorite que getContactDisplayName : un renommage cote WhatsApp doit toujours
+  // se repercuter sur le pseudo affiche cote Discord, meme si le contact est "lie".
+  const savedName = jid ? contactSavedNameCache.get(jid) : null;
+  if (savedName) return savedName;
+
   const linkedName = await getLinkedDiscordDisplayName(number);
   if (linkedName) return linkedName;
 
   return (
-    contactSavedNameCache.get(jid) ||
     msg.pushName ||
-    contactNotifyNameCache.get(jid) ||
+    (jid ? contactNotifyNameCache.get(jid) : null) ||
     number
   );
 }
@@ -1877,22 +1897,20 @@ async function startWaSocket() {
 
   newSock.ev.on("creds.update", saveCreds);
 
-  newSock.ev.on("contacts.upsert", (contacts) => {
+  const cacheContactBatch = (contacts) => {
+    if (!contacts) return;
     for (const c of contacts) {
-      if (!c.id) continue;
+      if (!c || !c.id) continue;
       if (c.name) contactSavedNameCache.set(c.id, c.name);
       if (c.notify) contactNotifyNameCache.set(c.id, c.notify);
     }
-  });
-  newSock.ev.on("contacts.update", (contacts) => {
-    for (const c of contacts) {
-      if (!c.id) continue;
+  };
 
-
-      if (c.name) contactSavedNameCache.set(c.id, c.name);
-      if (c.notify) contactNotifyNameCache.set(c.id, c.notify);
-    }
-  });
+  // Sync initial complet (envoye a la connexion) : sans ca, un contact renomme avant
+  // le demarrage/redemarrage du bot ne serait connu qu'a la prochaine modification.
+  newSock.ev.on("contacts.set", ({ contacts }) => cacheContactBatch(contacts));
+  newSock.ev.on("contacts.upsert", (contacts) => cacheContactBatch(contacts));
+  newSock.ev.on("contacts.update", (contacts) => cacheContactBatch(contacts));
 
   newSock.ev.on("connection.update", async (update) => {
     if (sock !== newSock) return;
@@ -2057,10 +2075,26 @@ async function handleIncomingWaMessage(msg) {
 
   if (msg.key.fromMe) {
     const rawText = extractText(msg).trim();
+
     if (rawText === "!txt") {
       sentByBridge.add(waId);
       await handleTxtCommand(msg, "wa");
+      return;
     }
+
+    // Le compte WhatsApp qui sert a la liaison (donc "moi") doit pouvoir muter/demuter
+    // meme s'il n'est pas techniquement admin du groupe, puisque c'est lui qui pilote le bot.
+    const group = await getSelectedGroup();
+    const ownJid = (sock && sock.user && sock.user.id) || jid;
+    if (group && rawText.startsWith("!mute ")) {
+      await handleMuteCommand(msg, group, ownJid, "Toi (liaison)", waId, rawText, { bypassAdminCheck: true });
+      return;
+    }
+    if (group && rawText.startsWith("!unmute ")) {
+      await handleUnmuteCommand(msg, group, ownJid, "Toi (liaison)", waId, { bypassAdminCheck: true });
+      return;
+    }
+
     return;
   }
 
@@ -2131,8 +2165,8 @@ async function handleWaProtocolMessage(msg) {
   }
 }
 
-async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
-  const adminCheck = isGroupAdmin(senderJid, group);
+async function handleMuteCommand(msg, group, senderJid, name, waId, rawText, { bypassAdminCheck = false } = {}) {
+  const adminCheck = bypassAdminCheck || isGroupAdmin(senderJid, group);
   if (!adminCheck) {
     await group.sendMessage("Seuls les admins peuvent utiliser !mute.", { quotedMessageId: waId });
     return;
@@ -2175,8 +2209,8 @@ async function handleMuteCommand(msg, group, senderJid, name, waId, rawText) {
   );
 }
 
-async function handleUnmuteCommand(msg, group, senderJid, name, waId) {
-  const adminCheck = isGroupAdmin(senderJid, group);
+async function handleUnmuteCommand(msg, group, senderJid, name, waId, { bypassAdminCheck = false } = {}) {
+  const adminCheck = bypassAdminCheck || isGroupAdmin(senderJid, group);
   if (!adminCheck) {
     await group.sendMessage("Seuls les admins peuvent utiliser !unmute.", { quotedMessageId: waId });
     return;
@@ -2536,7 +2570,7 @@ async function relayDiscordMessageToWa(message, group, name, content) {
       }
 
       const sendOptions = { ...replyOptions, ...(mentions.length ? { mentions } : {}) };
-      const sent = await sendWaMessageNow(group.id, `*${name}* : ${waContent}`, sendOptions);
+      const sent = await sendWaMessageNow(group.id, { text: `*${name}* : ${waContent}` }, sendOptions);
 
       if (sent) {
         sentByBridge.add(sent.key.id);
@@ -2632,7 +2666,7 @@ discordClient.on("messageCreate", async (message) => {
       await relayDiscordPollToWa(message, group, name);
     }, `DC poll ${message.id}`).catch(async (e) => {
       logError(`Erreur file DC->WA poll ${message.id}`, e);
-      try { await message.react("⚠️"); } catch (_) {}
+      try { await message.react("âš ï¸"); } catch (_) {}
     });
     return;
   }
@@ -2651,7 +2685,7 @@ discordClient.on("messageCreate", async (message) => {
     await relayDiscordMessageToWa(message, group, name, content);
   }, `DC message ${message.id}`).catch(async (e) => {
     logError(`Erreur file DC->WA ${message.id}`, e);
-    try { await message.react("⚠️"); } catch (_) {}
+    try { await message.react("âš ï¸"); } catch (_) {}
   });
 });
 
@@ -2697,3 +2731,74 @@ startWaSocket().catch((e) => {
     scheduleReconnect(`echec demarrage initial: ${e.message}`);
   } catch (_) {}
 });
+
+// ==========================================================================
+// CONSOLE ADMIN (terminal)
+// ==========================================================================
+function startAdminConsole() {
+  if (!process.stdin.isTTY) {
+    console.log("(Console admin desactivee : pas de terminal interactif attache.)");
+    return;
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  console.log("");
+  console.log("=== Console admin ===");
+  console.log("Tape un message + Entree pour l'envoyer sur WhatsApp ET Discord.");
+  console.log("Prefixe 'wa ' pour WhatsApp seulement, 'dc ' pour Discord seulement.");
+  console.log("======================");
+  console.log("");
+
+  rl.on("line", async (line) => {
+    const raw = line.trim();
+    if (!raw) return;
+
+    let target = "all";
+    let text = raw;
+
+    if (/^wa[: ]\s*/i.test(raw)) {
+      target = "wa";
+      text = raw.replace(/^wa[: ]\s*/i, "");
+    } else if (/^dc[: ]\s*/i.test(raw)) {
+      target = "dc";
+      text = raw.replace(/^dc[: ]\s*/i, "");
+    }
+
+    if (!text) {
+      console.log("Message vide, rien envoye.");
+      return;
+    }
+
+    if (target === "wa" || target === "all") {
+      try {
+        const group = await getSelectedGroup();
+        if (!group) {
+          console.log("Aucun groupe WhatsApp selectionne, envoi WA ignore.");
+        } else {
+          await sendWaMessage(group.id, text);
+          console.log("-> Envoye sur WhatsApp.");
+        }
+      } catch (e) {
+        console.log("Erreur envoi WhatsApp :", e.message);
+      }
+    }
+
+    if (target === "dc" || target === "all") {
+      try {
+        const channel = await getDiscordChannel();
+        if (!channel) {
+          console.log("Salon Discord introuvable, envoi Discord ignore.");
+        } else {
+          await channel.send(text);
+          console.log("-> Envoye sur Discord.");
+        }
+      } catch (e) {
+        console.log("Erreur envoi Discord :", e.message);
+      }
+    }
+  });
+}
+
+startAdminConsole();
+
