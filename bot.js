@@ -24,7 +24,6 @@ const {
   default: makeWASocket,
   initAuthCreds,
   BufferJSON,
-  fetchLatestBaileysVersion,
   downloadMediaMessage,
   getContentType,
   DisconnectReason,
@@ -174,8 +173,6 @@ const discordClient = new Client({
 
 let sock = null;
 
-// Sans ces listeners, un evenement "error"/"shardError" du client Discord (coupure
-// websocket, probleme reseau, etc.) peut faire planter tout le process Node.
 discordClient.on("error", (e) => logError("Erreur client Discord (websocket)", e));
 discordClient.on("shardError", (e) => logError("Erreur shard Discord", e));
 discordClient.on("shardDisconnect", (event, id) => console.warn(`Shard Discord ${id} deconnecte (code ${event && event.code})`));
@@ -425,6 +422,7 @@ let discordNotifiedThisCycle = false;
 
 const RECONNECT_BASE_DELAY_MS = 3000;
 const RECONNECT_MAX_DELAY_MS  = 60000;
+const CONNECTION_FAILURE_COOLDOWN_MS = 5 * 60 * 1000;
 
 function clearPendingReconnect() {
   if (reconnectTimer) {
@@ -467,7 +465,7 @@ async function notifyDiscordOnce(text) {
   } catch (_) {}
 }
 
-function scheduleReconnect(reason, { immediate = false, clearSession = false } = {}) {
+function scheduleReconnect(reason, { immediate = false, clearSession = false, forceDelayMs = null } = {}) {
   clearPendingReconnect();
   waRestartInProgress = true;
   waReady = false;
@@ -485,7 +483,7 @@ function scheduleReconnect(reason, { immediate = false, clearSession = false } =
     reconnectAttempts = 0;
   }
 
-  const delay = immediate ? 500 : computeBackoffDelay();
+  const delay = forceDelayMs != null ? forceDelayMs : (immediate ? 500 : computeBackoffDelay());
   reconnectAttempts += 1;
 
   console.warn(
@@ -532,8 +530,8 @@ function requestWaSocketEnd(reason) {
 }
 
 async function forceQrResend() {
-  if (waRestartInProgress) {
-    console.log("Regeneration QR ignoree : un redemarrage est deja en cours.");
+  if (waRestartInProgress && !reconnectTimer) {
+    console.log("Regeneration QR ignoree : une connexion est deja activement en cours de negociation.");
     return;
   }
   clearPendingReconnect();
@@ -549,6 +547,14 @@ async function forceQrResend() {
   } catch (e) {
     logError("Erreur logout() pendant la regeneration QR", e);
   }
+
+  const staleSock = sock;
+  if (staleSock) {
+    try { staleSock.ev.removeAllListeners(); } catch (_) {}
+    try { staleSock.end(undefined); } catch (_) {}
+    if (sock === staleSock) sock = null;
+  }
+
   try {
     fs.rmSync(AUTH_DIR, { recursive: true, force: true });
     fs.rmSync(AUTH_BACKUP_DIR, { recursive: true, force: true });
@@ -763,9 +769,6 @@ function isRetryableWaSendError(e) {
 }
 
 async function sendWaMessageNow(jid, payload, options = {}) {
-  // Filet de securite : accepte aussi une chaine brute au cas ou un appelant l'oublierait,
-  // et fusionne les mentions dans le payload (Baileys les attend la, pas dans les options
-  // d'envoi) - sans ca les pings @mention / @everyone partis de Discord etaient silencieusement perdus.
   const normalizedPayload = typeof payload === "string" ? { text: payload } : { ...payload };
   if (options.mentions && options.mentions.length) normalizedPayload.mentions = options.mentions;
 
@@ -1084,8 +1087,6 @@ async function getContactDisplayName(jid) {
   if (!jid) return "Inconnu";
   const number = jid.split("@")[0];
 
-  // Priorite : nom enregistre dans le carnet d'adresses WhatsApp (renomme = source de verite),
-  // puis le pseudo Discord lie (utile seulement si le contact n'a pas de nom WA), puis le reste.
   const savedName = contactSavedNameCache.get(jid);
   if (savedName) return savedName;
 
@@ -1099,8 +1100,6 @@ async function getSenderName(msg) {
   const jid = getSenderJid(msg);
   const number = jid ? jid.split("@")[0] : "Inconnu";
 
-  // Meme priorite que getContactDisplayName : un renommage cote WhatsApp doit toujours
-  // se repercuter sur le pseudo affiche cote Discord, meme si le contact est "lie".
   const savedName = jid ? contactSavedNameCache.get(jid) : null;
   if (savedName) return savedName;
 
@@ -1732,11 +1731,15 @@ discordClient.on("interactionCreate", async (interaction) => {
       await safeReply("WhatsApp est deja connecte, pas besoin de QR code.\nSi tu veux quand meme reconnecter avec un nouveau numero, utilise `/qr` apres avoir deconnecte l'appareil lie depuis WhatsApp > Appareils connectes.");
       return;
     }
-    if (waRestartInProgress) {
+    if (waRestartInProgress && !reconnectTimer) {
       await safeReply("Le client WhatsApp est en cours de (re)demarrage, patiente quelques secondes et reessaie - le QR arrivera automatiquement s'il en faut un.");
       return;
     }
-    await safeReply("Regeneration du QR code en cours... il sera envoye sur ce salon dans quelques secondes.");
+    if (reconnectTimer) {
+      await safeReply("Une pause de reconnexion etait en cours, elle est annulee : nouvelle tentative immediate...");
+    } else {
+      await safeReply("Regeneration du QR code en cours... il sera envoye sur ce salon dans quelques secondes.");
+    }
     forceQrResend();
     return;
   }
@@ -1862,10 +1865,8 @@ async function startWaSocket() {
   waRestartInProgress = true;
 
   const { state, saveCreds } = await useHardenedMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
 
   const newSock = makeWASocket({
-    version,
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, waLogger),
@@ -1875,7 +1876,6 @@ async function startWaSocket() {
     syncFullHistory: false,
     markOnlineOnConnect: false,
 
-    // Reglages de stabilite reseau
     connectTimeoutMs: 60000,
     keepAliveIntervalMs: 25000,
     defaultQueryTimeoutMs: 60000,
@@ -1906,8 +1906,6 @@ async function startWaSocket() {
     }
   };
 
-  // Sync initial complet (envoye a la connexion) : sans ca, un contact renomme avant
-  // le demarrage/redemarrage du bot ne serait connu qu'a la prochaine modification.
   newSock.ev.on("contacts.set", ({ contacts }) => cacheContactBatch(contacts));
   newSock.ev.on("contacts.upsert", (contacts) => cacheContactBatch(contacts));
   newSock.ev.on("contacts.update", (contacts) => cacheContactBatch(contacts));
@@ -1972,6 +1970,8 @@ async function startWaSocket() {
 
         const isConflict = statusCode === DisconnectReason.connectionReplaced;
 
+        const isConnectionFailure = statusCode === 405;
+
         if (needsFreshSession) {
 
           if (
@@ -1998,6 +1998,15 @@ async function startWaSocket() {
 
         if (isBenignRestart) {
           scheduleReconnect(`restartRequired: ${errMsg}`, { immediate: true });
+          return;
+        }
+
+        if (isConnectionFailure) {
+          notifyDiscordOnce(
+            "WhatsApp a refuse la connexion (code 405, rejet cote serveur pendant le pairing). " +
+            "C'est generalement temporaire (IP ou tentatives trop rapprochees) : pause de 5 minutes avant nouvelle tentative..."
+          ).catch(() => {});
+          scheduleReconnect(`connectionFailure 405: ${errMsg}`, { forceDelayMs: CONNECTION_FAILURE_COOLDOWN_MS });
           return;
         }
 
@@ -2082,8 +2091,6 @@ async function handleIncomingWaMessage(msg) {
       return;
     }
 
-    // Le compte WhatsApp qui sert a la liaison (donc "moi") doit pouvoir muter/demuter
-    // meme s'il n'est pas techniquement admin du groupe, puisque c'est lui qui pilote le bot.
     const group = await getSelectedGroup();
     const ownJid = (sock && sock.user && sock.user.id) || jid;
     if (group && rawText.startsWith("!mute ")) {
@@ -2666,7 +2673,7 @@ discordClient.on("messageCreate", async (message) => {
       await relayDiscordPollToWa(message, group, name);
     }, `DC poll ${message.id}`).catch(async (e) => {
       logError(`Erreur file DC->WA poll ${message.id}`, e);
-      try { await message.react("âš ï¸"); } catch (_) {}
+      try { await message.react("??"); } catch (_) {}
     });
     return;
   }
@@ -2685,7 +2692,7 @@ discordClient.on("messageCreate", async (message) => {
     await relayDiscordMessageToWa(message, group, name, content);
   }, `DC message ${message.id}`).catch(async (e) => {
     logError(`Erreur file DC->WA ${message.id}`, e);
-    try { await message.react("âš ï¸"); } catch (_) {}
+    try { await message.react("??"); } catch (_) {}
   });
 });
 
@@ -2801,4 +2808,3 @@ function startAdminConsole() {
 }
 
 startAdminConsole();
-
